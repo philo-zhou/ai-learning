@@ -1,0 +1,139 @@
+# DeepEP：MoE dispatch/combine 专用通信库
+
+> 层次：上层（跨中层） · 来源：third_party/DeepEP@93eb6eb（V2.5，`deep_ep/__init__.py` 中 `__version__ = '2.5.0'`）、third_party/nccl@3e46c08（GIN / device API / `contrib/nccl_ep`）、third_party/vllm@02653fa 与 third_party/sglang@d2a4364（V1 API 调用点）、ai-infra-book 第 6、7、9 章
+
+## 一句话
+
+DeepEP 把 MoE 的“按路由把 token 发给专家（dispatch）+ 把专家输出加权送回（combine）”做成 GPU 端发起的专用 All-to-All kernel：V1 用 NVSHMEM（normal：NVLink+RDMA 分层转发；low-latency：纯 RDMA IBGDA + recv hook），本地的 V2.5 已改用 NCCL GIN 后端并把两种模式统一进 `EPBuffer`。
+
+## 重要版本说明（先读）
+
+- 本地 `third_party/DeepEP@93eb6eb` 是 **V2.5**。README 明确：“Fully remove V1, including its APIs, NVSHMEM backend, and legacy documentation. NVSHMEM is no longer a dependency”，并且 “EP dispatch and combine require GPU SMs; zero-SM RDMA EP is not supported”。
+- 因此任务中提到的 V1 文件（`csrc/kernels/intranode.cu`、`internode.cu`、`internode_ll.cu`、`deep_ep/buffer.py` 等）**在本地不存在**。下文 V1 部分只写概念；V1 的 Python API 名字能在本地 vLLM/SGLang 的调用点看到，引用的是调用点。
+- 待确认：V1 源码结构与 kernel 角色名；确认方式：`git clone https://github.com/deepseek-ai/DeepEP` 后 checkout V2 之前的 tag/commit，查 `csrc/kernels/` 与 `deep_ep/buffer.py`。
+- 框架侧版本错配：vLLM/SGLang 仍在调用 V1 `deep_ep.Buffer`（HT/LL）与 V2 早期的 `deep_ep.ElasticBuffer`（`third_party/vllm/vllm/distributed/device_communicators/all2all.py` `DeepEPV2All2AllManager`），而 V2.5 已改名为 `EPBuffer`。ai-infra-book 也记录了这一点（`third_party/ai-infra-book/manuscripts/09-分布式推理.md` 9.4.3：“V2 的公开接口使用 ElasticBuffer，底层采用 NCCL Gin……并移除了 V1 中不占用 SM、直接经 RDMA 收发的低延迟 EP 通信路径”）。
+
+## 在调用链中的位置
+
+```text
+MoE 层（router 输出 topk_idx/topk_weights）
+  vLLM:   fused_moe/prepare_finalize/deepep_ht.py | deepep_ll.py | deepep_v2.py
+  SGLang: layers/moe/token_dispatcher/deepep.py | deepep_v2.py
+        │  dispatch(x, topk_idx, ...) → 专家 GEMM（grouped GEMM）→ combine(expert_out, handle)
+        ▼
+DeepEP Buffer（V1: Buffer / V2: ElasticBuffer / V2.5: EPBuffer）
+        │  复用或新建 NCCL communicator（V2.5：EP_REUSE_NCCL_COMM 时取 PyTorch backend._comm_ptr()）
+        ▼
+V1：NVSHMEM（对称堆、IBGDA put）+ CUDA IPC（NVLink buffer）
+V2.5：NCCL device API —— LSA（NVLink load/store，ncclGetLsaDevicePointer）
+                        GIN（GPU 发起 RDMA put/signal，GDAKI 类型）
+        ▼
+NVLink（scale-up） / InfiniBand（scale-out，推荐自适应路由、独立 VL）
+```
+
+## 核心概念
+
+### 1. dispatch / combine 语义
+
+- **dispatch**：每个 token 按 top-k 路由复制到若干目标专家所在 rank。先要算布局：每个 rank、每个 RDMA 节点、每个专家各收多少 token、某 token 是否发往某 rank（V1 `get_dispatch_layout` 的返回值在 vLLM 调用点可见：`num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank`，见 `third_party/vllm/vllm/model_executor/layers/fused_moe/prepare_finalize/deepep_ht.py`）。接收端按专家整理成 grouped GEMM 需要的布局。
+- **combine**：dispatch 的逆过程，专家输出按 handle 记录的来源送回原 rank 并按 top-k 权重求和。数据量矩阵是 dispatch 的转置（`third_party/ai-infra-book/manuscripts/07-数据中心网络.md` 7.2.3）。
+- **handle**：dispatch 产生的路由元数据，combine 和反向复用（训练中 dispatch 的反向就是 combine，combine 的反向就是 dispatch——V2.5 README 示例 `dispatch_backward` / `combine_backward` 正是这样写的）。
+- **精度**：dispatch 常用 FP8（带 scale），combine 用 BF16。
+- **去重**：同一 token 发往同一目的卡上的多个专家时只发一次（按卡而非按专家发送），`06-超节点.md` 6.2.6 算例中流量减半。
+
+### 2. V1 normal（高吞吐）kernel —— 概念
+
+- 场景：训练与推理 prefill，batch 大（数千 token/rank），追求带宽。
+- 节点内：通过 NVLink（CUDA IPC 映射的 buffer）直接写对端。
+- 跨节点：**两跳转发**——token 先经 RDMA 发到远端节点上“同 local rank 号”的 GPU（rail 对齐，只用同号网卡、避免跨轨），再由它经 NVLink 转发给该节点内真正持有专家的 GPU。这样跨节点流量按节点聚合（同一 token 发往一个节点的多个 GPU 只走一次 RDMA），NVLink 带宽用于节点内扇出。
+- 需要 CPU 同步拿到接收计数来分配输出张量（vLLM 注释：“the dispatch kernel will block the CPU”，见 `deepep_ht.py`），因此不适合 CUDA Graph。
+- 占用一定数量 SM 作为通信 warp（`Buffer.set_num_sms`，V1；vLLM `DeepEPAll2AllManagerBase` 中 `num_sms = 20`）。
+- 待确认：V1 中 RDMA sender / forwarder / NVL receiver 的 warp 角色划分；确认方式：V1 源码 `csrc/kernels/internode.cu`。
+
+### 3. V1 low-latency kernel —— 概念
+
+- 场景：推理 decode，每 rank 只有几十到一百多 token，追求延迟、要求可被 CUDA Graph 捕获。
+- **纯 RDMA**：所有跨 rank 传输（包括节点内）都走 RDMA，避免 NVLink 转发的额外同步；用 **IBGDA**（GPU 直接写 NIC doorbell，绕过 CPU proxy）发起 put。
+- **固定容量 buffer**：按 `num_max_dispatch_tokens_per_rank` 预分配（SGLang `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` 默认 128），输出形状固定 → 无 CPU 同步、可 CUDA Graph。
+- **hook 式通算重叠**：`low_latency_dispatch(..., return_recv_hook=True)` 只发出 RDMA 写就返回，返回一个 `hook`；调用方先去做其他计算（如另一个 micro-batch 的 attention），稍后调用 `hook()` 才执行接收端等待/整理。发出与接收之间**不占用 SM**（数据由 NIC 搬运）。调用点：`third_party/vllm/vllm/model_executor/layers/fused_moe/prepare_finalize/deepep_ll.py`（`return_recv_hook=True`）、`third_party/sglang/python/sglang/srt/layers/moe/token_dispatcher/deepep.py`（`hook() if self.return_recv_hook else event.current_stream_wait()`）。
+- 代价：同节点流量也走网卡，带宽不如 NVLink；buffer 按最大 token 数预留，显存大。
+
+### 4. V2 / V2.5（本地代码）
+
+- 统一接口：`EPBuffer` 同时覆盖高吞吐与低延迟；按拓扑分 **direct**（scaleout=1，所有 rank 在一个 scale-up 域，直接 NVLink/GIN）与 **hybrid**（scaleout>1，RDMA + NVLink 转发，对应 V1 normal 的分层思想）。
+- 后端从 NVSHMEM 换成 **NCCL GIN**：可复用框架已有的 NCCL communicator，不再单独初始化 NVSHMEM。
+- SM 与 QP 数由解析模型计算（`get_theoretical_num_sms` / `get_theoretical_num_qps`），不再 auto-tune。
+- 重叠改为 **deferred epilogue**：`defer_epilogue=True` + `async_with_compute_stream=True` 时 dispatch/combine 返回 `EventOverlap`，`.wait()`/`current_stream_wait()` 时在当前 stream 上执行收尾（拷贝/整理），中间可插入独立计算。
+- 不再支持 0-SM 的 RDMA LL 路径（hook 期间不占 SM 的能力被移除）。
+- 扩展：`lb_prefetch_weights` / `lb_reduce_grads`（冗余专家权重预取、梯度回收）、`BucketBuffer`（CP/DP 的 AG/RS/AR）、`EngramBuffer`、`PPBuffer`——DeepEP 更名为 “DeepEveryParallel”。
+
+### 5. 与 NVSHMEM 的关系
+
+- V1：NVSHMEM 提供对称堆（每个 rank 相同偏移的 buffer）、GPU 端 put/get/signal 与 IBGDA 传输，DeepEP 在其上写 kernel；DeepEP 需要打补丁/特定版本的 NVSHMEM（待确认具体版本与补丁；确认方式：V1 源码 `third-party/` 与安装文档）。
+- V2.5：不依赖 NVSHMEM。对称内存由 `ncclMemAlloc` 或 `cuMemCreate/cuMemMap` 分配并 `ncclCommWindowRegister` 注册；NVLink 对端指针来自 `ncclGetLsaDevicePointer`，NVLS multimem 指针来自 `ncclGetLsaMultimemDevicePointer`；RDMA 用 GIN 的 put / signal。等价地说，NCCL 2.3x 的 device API 吸收了“NVSHMEM 式”的 GPU 发起通信能力。
+
+### 6. 为什么 MoE All2All 是 CCL 的新挑战
+
+1. **动态、不均匀、事先未知**：每对 rank 的消息大小由当次路由决定，需要先交换计数（多一次同步或 GPU 端计数），无法像 AllReduce 那样静态切 chunk；热点专家造成 skew（`09-分布式推理.md` 9.4.1：EP8 约 8%、EP256 可达 4×）。
+2. **数据重排与通信耦合**：发送前按目的地打包、接收后按专家排布给 grouped GEMM，最好在通信 kernel 内完成（避免额外的 permute kernel 和显存往返）。
+3. **两种极端工况**：prefill/训练要带宽（MiB~GiB 级），decode 要延迟（每 rank 百 token 级、KiB 级消息、CUDA Graph），一种算法难以兼顾 → HT/LL 两套。
+4. **分层拓扑**：NVLink 与 RDMA 带宽差一个数量级，要按节点聚合跨节点流量、用 NVLink 扇出；rail 对齐避免跨轨。
+5. **SM 争用与重叠**：通信 kernel 占 SM 会拖慢专家 GEMM；需要 hook/deferred epilogue、双 batch 重叠、尽量少 SM。
+6. **网络侧**：大量小消息、多 QP（V2.5 hybrid 默认 65/129 个 QP）、对 RDMA atomic 性能敏感（README 推荐 `PCI_ATOMIC_MODE=4`），对拥塞控制与自适应路由敏感，需要用 VL/SL 与其他流量隔离（`EP_OVERRIDE_RDMA_SL` > `sl_idx` > `EP_DEFAULT_RDMA_SL` > NCCL 默认）。
+7. **通用库在追赶**：NCCL 自身在 `third_party/nccl/contrib/nccl_ep/` 提供 NCCL EP（`ncclEpDispatch` / `ncclEpCombine`，LL 与 HT 两种算法，基于 LSA 与 GIN；README 注明已迁至 NVIDIA/nccl-extensions），NCCL 核心也新增了 `ncclAlltoAll`、device API 与 `src/gin/`——说明 EP 通信正从“框架外专用库”回流到 CCL。
+
+## 源码导读（路径 + 函数 + 作用）
+
+均为 `third_party/DeepEP/` 下的 V2.5 代码。
+
+| 路径 | 符号 | 作用 |
+|---|---|---|
+| `deep_ep/buffers/ep.py` | `class EPBuffer(BufferBase)` | 构造参数含 `group, num_max_tokens_per_rank, hidden, num_topk, use_fp8_dispatch, allow_hybrid_mode, sl_idx, num_allocated_qps, num_cpu_timeout_secs, num_gpu_timeout_secs`；`num_allocated_qps=0` 时 hybrid 模式取 65（支持快速 RDMA atomic）或 129，否则 17 |
+| 同上 | `EPBuffer.get_buffer_size_hint` / `get_theoretical_num_sms` / `get_theoretical_num_qps` | 解析式估算 buffer、SM、QP；direct 模式 QP=`min(num_sms, 9)`，hybrid 为 `num_sms*16+1` |
+| 同上 | `EPBuffer.dispatch(...)` | 参数 `do_cpu_sync`（训练/prefill 拿精确大小；decode 用 GPU 侧计数）、`do_expand`、`expert_alignment`、`defer_epilogue`、`previous_event`、`async_with_compute_stream`；返回 `recv_x, recv_topk_idx, recv_topk_weights, EPHandle, EventOverlap` |
+| 同上 | `EPBuffer.combine(x, handle, topk_weights, bias, ...)` | 逆向发送并求和，`bias` 可在 epilogue 中加 shared expert 输出或残差 |
+| 同上 | `class EPHandle` | 路由元数据（`psum_num_recv_tokens_per_expert`、`recv_src_metadata` 等） |
+| `deep_ep/utils/event.py` | `EventOverlap` | `current_stream_wait`、`wait`、`register_hook_after_wait` |
+| `deep_ep/comm/handle.py` | `get_nccl_comm_handle` | 默认复用 PyTorch NCCL comm（`backend._comm_ptr()`，`EP_REUSE_NCCL_COMM`）；否则 all-gather unique id 自建 |
+| `csrc/kernels/comm/context.cpp` | `comm::Context` | 查询 `ncclCommQueryProperties`，要求 `NCCL_GIN_TYPE_GDAKI`；`ncclDevCommCreate`；`ncclCommWindowRegister(..., NCCL_WIN_STRICT_ORDERING)`（集合调用，内部 bootstrap barrier）；`ncclGetLsaDevicePointer` / `ncclGetLsaMultimemDevicePointer` |
+| `csrc/kernels/comm/symmetric.hpp` | `GPUSymmetricMemory`、`ElasticSymmetricMemory`、`HybridElasticSymmetricMemory` | 对称内存（`ncclMemAlloc` 或 `cuMemCreate/cuMemMap` + POSIX-FD/fabric 句柄） |
+| `csrc/kernels/ep/dispatch.hpp` | `launch_dispatch` | `num_scaleout_ranks == 1` 走 direct（`dispatch_impl`），否则 hybrid（`hybrid_dispatch_impl`） |
+| `deep_ep/include/deep_ep/impls/ep/dispatch.cuh` | `dispatch_impl` | notify warp + dispatch warp；`gin.put` 或经 `gin.get_sym_ptr` 直接 NVLink 写 |
+| `deep_ep/include/deep_ep/impls/ep/hybrid_dispatch.cuh` | `hybrid_dispatch_impl` | notify / scaleout / forward 三类 warp，`kNumScaleoutWarps == kNumForwardWarps`，“a warp is a channel”；scaleout warp 用 `gin.put<ncclTeamTagRail>` 跨节点同轨 RDMA，forward warp 经 `ncclTeamTagLsa` 对称指针 NVLink 转发——V1 normal 两跳转发思想的 V2 版 |
+| `deep_ep/include/deep_ep/impls/ep/combine.cuh` / `hybrid_combine.cuh` | `combine_impl` / `hybrid_combine_impl` | combine；`gin.is_nvlink_accessible` 判断能否 NVLink 直达 |
+| `deep_ep/include/deep_ep/impls/ep/dispatch_copy_epilogue.cuh` / `combine_reduce_epilogue.cuh` | epilogue kernel | deferred epilogue 的实体 |
+| `deep_ep/include/deep_ep/comm/handle.cuh` | `struct NCCLGin` | 设备侧封装：`put`、`put_value`、`red_add_rel`、`get`、`flush`、`wait`、`get_sym_ptr`；team 标签 `ncclTeamTag{World,Lsa,Rail}` |
+| `tests/ep/test_ep.py` | `test_dispatch_combine`、`test_loop` | 默认参数 `--num-tokens 4096 --hidden 7168 --num-topk 6 --num-experts 256` |
+
+NCCL 侧对应：`third_party/nccl/src/include/nccl_device/core.h`（`NCCL_GIN_TYPE_PROXY = 2`、`NCCL_GIN_TYPE_GDAKI = 3`）、`third_party/nccl/src/transport/net_ib/gdaki/`（GDAKI 的 IB 实现）、`third_party/nccl/src/gin/`（GIN host 侧与 proxy）。
+
+## 性能要点与常见坑
+
+- V2.5 README 无本地性能表；ai-infra-book 的研究快照（`third_party/ai-infra-book/research/ub-ep-integration-2026-09-10/sources/deepep.md`，V2 早期版）记录：SM90+CX7、EP 8×2、8K token/batch、hidden 7168、top-8、FP8 dispatch/BF16 combine 时 dispatch 瓶颈带宽约 90 GB/s（RDMA）、12 个 SM；SM100 单节点 EP8 NVLink 约 726 GB/s（64 SM）。注明是“逻辑带宽”（含本地 rank 流量）。
+- 所有 rank 必须对 `num_max_tokens_per_rank` 取一致值，并覆盖训练/prefill/decode 的最大 batch。
+- `do_cpu_sync=False`（decode）时输出按容量分配，专家 GEMM 必须用 `handle.psum_num_recv_tokens_per_expert` 识别有效区间；错误使用会把填充数据当有效 token。
+- 网络：推荐 IB 自适应路由、为 EP 流量单独 VL；最大带宽场景建议关闭拥塞控制；RoCE“理论兼容”但未充分测试——RoCE 集群部署需要额外验证。
+- 超时：`num_cpu_timeout_secs=300`、`num_gpu_timeout_secs=100`，GPU 端超时用于检测对端掉线导致的死等。
+- 框架版本错配（V1/V2/V2.5 API）是集成时最常见的问题，先确认安装的 `deep_ep.__version__`。
+
+## 面试自测
+
+1. 问：DeepEP normal 模式跨节点为什么要“先 RDMA 到同号 GPU 再 NVLink 转发”？
+   要点：按节点聚合，一个 token 去同一节点多个专家只跨网一次；rail 对齐只用同号网卡、避免跨轨/PCIe 交换；节点内扇出用高带宽 NVLink；把 RDMA 消息变大、次数变少。
+2. 问：low-latency 模式为什么能 CUDA Graph？为什么要纯 RDMA？
+   要点：固定最大 token 容量、输出形状固定、无 CPU 同步拿计数；纯 RDMA 用 IBGDA 由 GPU 直接发起，省去节点内转发的同步阶段，路径最短；代价是同节点也走网卡、显存预留大。
+3. 问：recv hook 如何做到通信不占 SM 的重叠？
+   要点：dispatch 只发出 RDMA 写立即返回 hook；数据由 NIC DMA 写入接收端 buffer，期间 GPU 执行别的 kernel；需要结果时调用 hook 做等待和整理。V2.5 已移除此 0-SM 路径，改为 deferred epilogue（仍需 SM）。
+4. 问：DeepEP V2 为什么从 NVSHMEM 换到 NCCL GIN？
+   要点：复用框架已有 NCCL communicator，免去独立初始化与补丁版 NVSHMEM 依赖；继承 NCCL 的拓扑探测、网络插件和窗口注册；NCCL device API（LSA+GIN）已提供 GPU 发起 put/signal 能力。
+5. 问：MoE All2All 相比传统集合通信新在哪？如果让你在 CCL 里支持它要做什么？
+   要点：动态不均匀消息、需先交换计数、通信与数据重排融合、HT/LL 两种工况、分层拓扑聚合、SM 争用、网络小消息与多 QP。CCL 侧：GPU 发起的 device API、对称内存/窗口注册、按节点分层的 A2A 算法、可 CUDA Graph 的固定容量模式、低 SM 占用、与路由元数据（handle）复用——NCCL 的 `contrib/nccl_ep` 就是这条路线。
+6. 问：训练中 dispatch 的反向是什么？
+   要点：combine（把梯度按原路由送回并对 top-k 副本求和）；combine 的反向是 dispatch；复用前向的 handle，避免重新计算布局与 CPU 同步。
+
+## 待深入
+
+- 待确认：V1 `csrc/kernels/internode.cu` 中 normal 模式的 channel/warp 角色与 `internode_ll.cu` 的 IBGDA 调用；确认方式：克隆 deepseek-ai/DeepEP 并 checkout V1 版本。
+- 读 `third_party/DeepEP/deep_ep/include/deep_ep/impls/ep/hybrid_dispatch.cuh` 全文，画出 scaleout/forward warp 的数据流与 signal 时序。
+- 读 `third_party/nccl/contrib/nccl_ep/README.md` 与 `device/ll_ep.cuh`、`device/hybrid_ep.cuh`，对比 NCCL EP 与 DeepEP 的 API 与算法。
+- 读 `third_party/nccl/src/transport/net_ib/gdaki/` 理解 GIN 的 GDAKI 实现与 IBGDA 的对应关系（可并入 `06-comm-compute-fusion/`）。

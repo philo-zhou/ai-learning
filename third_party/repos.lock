@@ -1,0 +1,11 @@
+# 外部学习资料的固定版本。格式：<目录名> <git URL> <commit>
+# 修改后运行 scripts/fetch_third_party.sh，并同步 docs/references/third-party.md。
+ai-infra-book https://github.com/bojieli/ai-infra-book.git 3bdcb4fcab73010eeaccf31cc10a8242a895d82e
+nccl https://github.com/NVIDIA/nccl.git 3e46c089f4ae4732722a419eb6096aead7e47a30
+nccl-tests https://github.com/NVIDIA/nccl-tests.git afd59abab774a6a4b492eb344bd0c845a0b7bb4d
+rdma-core https://github.com/linux-rdma/rdma-core.git bd3282a1cf1025c7869a8664c2d54266a4dded44
+perftest https://github.com/linux-rdma/perftest.git 05200c2fc2599f72dc1b6bd70de1b966c88150d9
+vllm https://github.com/vllm-project/vllm.git 02653fa22cd1232cd252165b901091bd4a96f04f
+sglang https://github.com/sgl-project/sglang.git d2a436446cca3d955358e7b4a5bf6881ea8591cd
+DeepEP https://github.com/deepseek-ai/DeepEP.git 93eb6eb238127e96c6d7a4a625a6dad158348509
+Triton-distributed https://github.com/ByteDance-Seed/Triton-distributed.git 7908e4ea9010bb2238f9f05b28c904fd4b71c60a
