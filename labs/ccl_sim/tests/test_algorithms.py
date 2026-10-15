@@ -315,6 +315,85 @@ class TestCostModel(unittest.TestCase):
                 self.assertEqual(fn(1, 1 << 20, self.ALPHA, self.BETA), 0.0)
 
 
+class TestFullMesh(unittest.TestCase):
+    """Full-mesh：每个 rank 与其他所有 rank 直连（NVSwitch 机内），一步就和所有对端交换。"""
+
+    ALPHA = 2e-6
+    BETA = cm.gbps_to_beta(400)
+
+    def setUp(self):
+        self.rng = random.Random(20261015)
+
+    def test_allreduce_variants_match_naive_sum(self):
+        for fn in [alg.fullmesh_allreduce_oneshot, alg.fullmesh_allreduce_twoshot]:
+            for n in [1, 2, 3, 4, 5, 8, 9]:
+                for length in [0, 1, 7, 16, 33]:
+                    with self.subTest(fn=fn.__name__, n=n, length=length):
+                        inputs = make_inputs(self.rng, n, length)
+                        expected = naive_sum(inputs)
+                        res = fn(inputs)
+                        self.assertEqual(res.outputs, [expected] * n)
+
+    def test_reduce_scatter_and_allgather_match_ring(self):
+        for n in [1, 2, 3, 6, 8]:
+            inputs = make_inputs(self.rng, n, 4 * n + 3)
+            with self.subTest(n=n, op="reduce_scatter"):
+                self.assertEqual(
+                    alg.fullmesh_reduce_scatter(inputs).outputs, alg.ring_reduce_scatter(inputs).outputs
+                )
+            pieces = [make_inputs(self.rng, 1, self.rng.randint(0, 5))[0] for _ in range(n)]
+            with self.subTest(n=n, op="allgather"):
+                self.assertEqual(alg.fullmesh_allgather(pieces).outputs, alg.ring_allgather(pieces).outputs)
+
+    def test_all2all_matches_naive(self):
+        for n in [1, 2, 3, 8]:
+            inputs = make_inputs(self.rng, n, n * 4)
+            with self.subTest(n=n):
+                self.assertEqual(alg.fullmesh_all2all(inputs).outputs, naive_all2all(inputs))
+
+    def test_steps_and_bytes(self):
+        n, length = 8, 64
+        inputs = make_inputs(self.rng, n, length)
+        one = alg.fullmesh_allreduce_oneshot(inputs)
+        two = alg.fullmesh_allreduce_twoshot(inputs)
+        self.assertEqual(one.num_steps, 1)
+        self.assertEqual(two.num_steps, 2)
+        # one-shot：每个 rank 把整个 buffer 发给 N-1 个对端；two-shot 与 Ring 的字节数相同
+        self.assertEqual(one.sent_elems_per_rank(), [(n - 1) * length] * n)
+        self.assertEqual(two.sent_elems_per_rank(), alg.ring_allreduce(inputs).sent_elems_per_rank())
+        self.assertEqual(alg.fullmesh_reduce_scatter(inputs).num_steps, 1)
+        self.assertEqual(alg.fullmesh_all2all(inputs).num_steps, 1)
+        self.assertEqual(alg.fullmesh_allreduce_twoshot([[1, 2]]).num_steps, 0)
+
+    def test_analytic_formula_matches_simulated_trace(self):
+        eb = 4
+        for n in [2, 3, 5, 8]:
+            length = n * 6
+            inputs = make_inputs(self.rng, n, length)
+            m = length * eb
+            pairs = [
+                (alg.fullmesh_allreduce_oneshot(inputs, elem_bytes=eb), cm.fullmesh_allreduce_oneshot(n, m, self.ALPHA, self.BETA)),
+                (alg.fullmesh_allreduce_twoshot(inputs, elem_bytes=eb), cm.fullmesh_allreduce_twoshot(n, m, self.ALPHA, self.BETA)),
+                (alg.fullmesh_reduce_scatter(inputs, elem_bytes=eb), cm.fullmesh_reduce_scatter(n, m, self.ALPHA, self.BETA)),
+                (alg.fullmesh_all2all(inputs, elem_bytes=eb), cm.fullmesh_all2all(n, m, self.ALPHA, self.BETA)),
+            ]
+            for res, expected in pairs:
+                with self.subTest(algo=res.algorithm, n=n):
+                    self.assertAlmostEqual(cm.cost_from_trace(res, self.ALPHA, self.BETA), expected, places=12)
+
+    def test_regimes_on_nvswitch(self):
+        """8 卡 NVSwitch：小消息 one-shot 最快；中等消息 two-shot 胜 Ring（少 2(N-1)-2 个 α，β 项相同）。"""
+        n = 8
+        small, mid = 32 << 10, 4 << 20
+        one = lambda m: cm.fullmesh_allreduce_oneshot(n, m, self.ALPHA, self.BETA)
+        two = lambda m: cm.fullmesh_allreduce_twoshot(n, m, self.ALPHA, self.BETA)
+        ring = lambda m: cm.ring_allreduce(n, m, self.ALPHA, self.BETA)
+        self.assertLess(one(small), two(small))
+        self.assertLess(two(mid), one(mid))
+        self.assertLess(two(mid), ring(mid))
+        self.assertAlmostEqual(ring(mid) - two(mid), (2 * (n - 1) - 2) * self.ALPHA, places=12)
+
+
 class TestCli(unittest.TestCase):
     def test_main_prints_tables(self):
         buf = io.StringIO()

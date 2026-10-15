@@ -64,6 +64,12 @@
 - 避免：认为 device-initiated 通信只能用 NVSHMEM——本地 DeepEP V2.5 已改用 NCCL GIN。
 - 相关代码或契约：`third_party/nccl/docs/userguide/source/usage/deviceapi.rst`、`third_party/nccl/docs/contrib/GIN/`、`notes/06-comm-compute-fusion/03-nvshmem-and-device-initiated.md`
 
+### Full-mesh / one-shot / two-shot
+
+- 定义：Full-mesh 指任意两 rank 直连（机内 NVSwitch），一步就与所有对端交换。one-shot AllReduce 让每个 rank 读所有对端的完整输入后本地归约（1 步、(N−1)·M 字节）；two-shot 是 Full-mesh ReduceScatter + AllGather（2 步、与 Ring 相同的 2(N−1)/N·M 字节）。
+- 避免：在 PCIe 或部分互联拓扑上套用 Full-mesh 的代价公式——N−1 条并发流会挤在同一条链路上。
+- 相关代码或契约：`notes/03-ccl-algorithms/05-handwrite-ring-fullmesh.md`、`labs/ccl_sim/algorithms.py`、`third_party/vllm/csrc/custom_all_reduce.cuh`
+
 ### dispatch / combine（EP）
 
 - 定义：MoE 专家并行中的两次 All-to-All-v。dispatch 按 top-k 路由把 token 发到专家所在 rank 并按专家排布；combine 把专家输出送回 token 原 rank 并按门控权重求和。

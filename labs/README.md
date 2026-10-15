@@ -31,7 +31,7 @@ python3 -m labs.ccl_sim --help
 
 输出三张表：
 
-1. AllReduce：Ring、Recursive Doubling、Halving-Doubling、不切块二叉树、流水线 Double Binary Tree 的耗时（微秒）和最优者，以及 Ring 对应的 busbw。
+1. AllReduce：Ring、Recursive Doubling、Halving-Doubling、不切块二叉树、流水线 Double Binary Tree、Full-mesh one-shot（`fm_oneshot`）与 two-shot（`fm_twoshot`）的耗时（微秒）和最优者，以及 Ring 对应的 busbw。Full-mesh 假设机内全互联（NVSwitch），建议用 `--alpha-us 2 --bw-gbps 400` 这类机内参数观察。
 2. 分层 AllReduce 与"把所有 rank 排成一个大环"的对比（节点内快、节点间慢）。
 3. All2All：Pairwise 与 Bruck 的对比。
 

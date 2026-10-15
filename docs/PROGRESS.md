@@ -10,7 +10,7 @@
 - 10 个外部资料按 `third_party/repos.lock` 固定版本拉取完毕（2026-10-15 新增 `DeepEP-hybrid-ep`），且均无本地改动 — 证据：`bash scripts/fetch_third_party.sh check` 全部 OK；逐个 `git -C third_party/<repo> status --porcelain` 为空。
 - `notes/00~09` 十个章节共 48 篇笔记（2026-10-15 新增 `notes/09-ep-kernels/` 五篇）；学习入口 `notes/00-roadmap/00-start-here.md`，章节索引 `notes/00-roadmap/README.md`。
 - 推理并行与 EP 通信调研：`docs/references/2026-10-14-inference-parallelism-ep-research.md`（17 个来源，13 条结论经过验证）。
-- `labs/ccl_sim` 算法模拟器与 α-β 代价模型，30 个单元测试。
+- `labs/ccl_sim` 算法模拟器与 α-β 代价模型（含 Full-mesh），36 个单元测试。
 - 治理入口：`AGENTS.md`（`CLAUDE.md`、`CODEBUDDY.md` 软链接）、`docs/`、`scripts/check_repo.py`、`scripts/fetch_third_party.sh`。
 
 ## 当前焦点
@@ -19,6 +19,7 @@
 
 ## 本轮完成并验证
 
+- 2026-10-15：Ring / Full-mesh 手写题笔记与 `labs/ccl_sim` 的 Full-mesh 实现 — 证据：`python3 scripts/check_repo.py`（labs 新增 6 个测试，共 36 个通过）；笔记中 Ring 伪代码的下标另用逐 rank 的锁步模拟在 N=1..9 验证；学习站点已上线 https://philo-zhou.github.io/ai-learning/（Pages 工作流第 2 次运行成功）。
 - 2026-10-15：学习站点 `site/`（Spec：`docs/superpowers/specs/2026-10-15-learning-site-design.md`；Plan：`docs/superpowers/plans/2026-10-15-learning-site.md`，Completed） — 证据：`cd site && npm run build` 输出 `site verify: passed`；中文搜索用构建出的索引离线测试，"拥塞控制""IBGDA""busbw""自适应路由"均命中相关笔记；首页、`00-start-here`（公式）、暗色模式截图人工检查。
 - 2026-10-15：新增 EP 专用通信库专章 `notes/09-ep-kernels/`（设计空间、DeepEP LL、Hybrid-EP、谱系与选型），依据 `third_party/DeepEP-hybrid-ep@10d4dd73` 源码撰写；同步更新 `05-framework-integration/04-deepep.md` 中原先的 V1 待确认项、学习入口、术语表 — 证据：`python3 scripts/check_repo.py`。
 - 外部资料拉取与版本锁定 — 证据：`bash scripts/fetch_third_party.sh check`；克隆路径在临时目录用单行 lock 验证通过。
@@ -45,7 +46,6 @@
 
 ## 风险与未知项
 
-- GitHub Pages：工作流已提交；仓库 Settings → Pages 的 Source 需设为 "GitHub Actions"（本机无 `gh` 与令牌，无法代为开启），开启后在 Actions 页重跑 "Deploy site"。
 - `09-ep-kernels` 中"同 QP 上 WRITE 后 ATOMIC 可见 ⇒ 数据可见"的结论依赖 RC 按序语义，在乱序放置网卡上的保证待确认（见该章 README 待深入）。
 - 学习站点：`npm install` 报告 esbuild 的 postinstall 被 npm allow-scripts 拦截，但构建正常（使用平台预编译包）；如在其他机器构建失败，运行 `npm approve-scripts esbuild`。
 - 学习路线是否改为"推理优先"尚未决定；若调整，需同步 `site/.vitepress/theme/components/RoadmapCards.vue` 的卡片数据。

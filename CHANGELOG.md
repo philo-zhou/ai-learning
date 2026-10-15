@@ -6,6 +6,7 @@
 
 ### Added
 
+- **Ring / Full-mesh 手写题** — `notes/03-ccl-algorithms/05-handwrite-ring-fullmesh.md`：Ring 与 Full-mesh 各原语的伪代码、GPU one-shot / two-shot kernel 与追问；`labs/ccl_sim` 新增 `fullmesh_*` 模拟与代价模型（CLI 表格新增 `fm_oneshot`、`fm_twoshot` 两列）及 `TestFullMesh` 测试。
 - **学习站点** — `site/`：VitePress 直接渲染 `notes/`、`docs/references/` 与术语表，技术手册风格主题（暖白/深墨蓝、三层知识色标）、首页路线卡片、中文全文搜索、公式渲染；`cd site && npm install && npm run dev` 启动，`npm run build` 构建并自检；`.github/workflows/deploy-site.yml` 把站点发布到 GitHub Pages（https://philo-zhou.github.io/ai-learning/）。`scripts/check_repo.py` 改为跳过 `site/node_modules` 与构建产物。
 - **EP 专用通信库专章** — `notes/09-ep-kernels/`：EP All2All 设计空间、DeepEP low-latency（固定槽位、同 QP 计数、IBGDA、recv hook、LogFMT）、Hybrid-EP（路由预计算、分层 RDMA/NVLink、TMA warp 专业化、节点内预归约）、谱系与选型；外部资料新增 `DeepEP-hybrid-ep`（上游 `hybrid-ep` 分支 @10d4dd73）。
 - **学习入口** — `notes/00-roadmap/00-start-here.md`：从大模型推理出发，梳理并行策略与通信的对应总表、EP dispatch/combine 的数据量与难点、主流 EP 方案全景（DeepEP V1/V2、NCCL EP、pplx、UCCL-EP、MegaScale-Infer 等）、发展趋势，以及把各章挂到主线上的学习顺序；README 与笔记总入口都指向它。

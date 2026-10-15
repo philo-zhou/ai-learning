@@ -18,6 +18,12 @@
 | halving_doubling_allreduce | 2 log2 N（N 必须是 2 的幂） | 2(N-1)/N * L |
 | binary_tree_allreduce | 2 floor(log2 N) | 非叶子更多，见函数说明 |
 | pairwise_all2all | N-1 | (N-1)/N * L |
+| fullmesh_allreduce_oneshot | 1 | (N-1) * L |
+| fullmesh_allreduce_twoshot | 2 | 2(N-1)/N * L |
+| fullmesh_reduce_scatter / allgather / all2all | 1 | (N-1)/N * L |
+
+Full-mesh 系列假设任意两 rank 直连（机内 NVSwitch），一个 step 内同时与 N-1 个对端通信，
+这些流共享本 rank 的端口带宽；在 Ring 拓扑或 PCIe 上这个假设不成立。
 """
 
 from __future__ import annotations
@@ -443,6 +449,110 @@ def binary_tree_allreduce(
         rec.run_step(f"broadcast(level={level})", bufs, msgs, "copy")
 
     return CommResult("binary_tree_allreduce", n, bufs, rec.steps, elem_bytes)
+
+
+# ---------------------------------------------------------------------------
+# Full-mesh：任意两 rank 直连（机内 NVSwitch），一个 step 内与所有对端交换
+# ---------------------------------------------------------------------------
+
+
+def fullmesh_reduce_scatter(
+    inputs: Sequence[Sequence[Number]], elem_bytes: int = DEFAULT_ELEM_BYTES, op: ReduceOp = operator.add
+) -> CommResult:
+    """Full-mesh ReduceScatter：1 步，rank r 把第 j 块直接发给 rank j（j ≠ r），接收方累加。
+
+    每 rank 发送 (N-1)/N × L，与 Ring 相同；但只有 1 个 α。前提是 N-1 条并发流能共享
+    一个 GPU 的 NVLink 总带宽（NVSwitch 满足；PCIe 或部分连接的拓扑不满足）。
+    """
+    n, length = _validate_equal_buffers(inputs)
+    bufs = [list(b) for b in inputs]
+    bounds = chunk_bounds(length, n)
+    rec = _Recorder(n)
+    if n > 1:
+        msgs = [(r, j, bounds[j][0], bounds[j][1]) for r in range(n) for j in range(n) if j != r]
+        rec.run_step("fullmesh-reduce-scatter", bufs, msgs, "reduce", op)
+    outputs = [bufs[r][bounds[r][0] : bounds[r][1]] for r in range(n)]
+    return CommResult("fullmesh_reduce_scatter", n, outputs, rec.steps, elem_bytes)
+
+
+def fullmesh_allgather(inputs: Sequence[Sequence[Number]], elem_bytes: int = DEFAULT_ELEM_BYTES) -> CommResult:
+    """Full-mesh AllGather：1 步，rank r 把自己的分片直接写到所有对端的对应位置。"""
+    if not isinstance(inputs, (list, tuple)) or len(inputs) == 0:
+        raise ValueError("inputs 必须是非空的 rank buffer 列表")
+    n = len(inputs)
+    bounds = []
+    start = 0
+    for piece in inputs:
+        bounds.append((start, start + len(piece)))
+        start += len(piece)
+    bufs = []
+    for r in range(n):
+        buf = [0] * start
+        buf[bounds[r][0] : bounds[r][1]] = list(inputs[r])
+        bufs.append(buf)
+    rec = _Recorder(n)
+    if n > 1:
+        msgs = [(r, j, bounds[r][0], bounds[r][1]) for r in range(n) for j in range(n) if j != r]
+        rec.run_step("fullmesh-allgather", bufs, msgs, "copy")
+    return CommResult("fullmesh_allgather", n, bufs, rec.steps, elem_bytes)
+
+
+def fullmesh_allreduce_oneshot(
+    inputs: Sequence[Sequence[Number]], elem_bytes: int = DEFAULT_ELEM_BYTES, op: ReduceOp = operator.add
+) -> CommResult:
+    """One-shot AllReduce：1 步，每个 rank 拿到所有对端的完整 buffer 并本地归约。
+
+    每 rank 收发 (N-1) × L：字节最多，但只有 1 个 α，适合 decode 的小消息。
+    对应 vLLM 的 ``cross_device_reduce_1stage``（各 rank 通过 CUDA IPC 直接读所有对端的 buffer）。
+    """
+    n, length = _validate_equal_buffers(inputs)
+    bufs = [list(b) for b in inputs]
+    rec = _Recorder(n)
+    if n > 1:
+        msgs = [(r, j, 0, length) for r in range(n) for j in range(n) if j != r]
+        rec.run_step("oneshot", bufs, msgs, "reduce", op)
+    return CommResult("fullmesh_allreduce_oneshot", n, bufs, rec.steps, elem_bytes)
+
+
+def fullmesh_allreduce_twoshot(
+    inputs: Sequence[Sequence[Number]], elem_bytes: int = DEFAULT_ELEM_BYTES, op: ReduceOp = operator.add
+) -> CommResult:
+    """Two-shot AllReduce = Full-mesh ReduceScatter（1 步）+ Full-mesh AllGather（1 步）。
+
+    字节数与 Ring 相同（2(N-1)/N × L），α 从 2(N-1) 个降到 2 个。
+    对应 vLLM 的 ``cross_device_reduce_2stage``。
+    """
+    n, length = _validate_equal_buffers(inputs)
+    bufs = [list(b) for b in inputs]
+    bounds = chunk_bounds(length, n)
+    rec = _Recorder(n)
+    if n > 1:
+        rs = [(r, j, bounds[j][0], bounds[j][1]) for r in range(n) for j in range(n) if j != r]
+        rec.run_step("twoshot-reduce-scatter", bufs, rs, "reduce", op)
+        ag = [(r, j, bounds[r][0], bounds[r][1]) for r in range(n) for j in range(n) if j != r]
+        rec.run_step("twoshot-allgather", bufs, ag, "copy")
+    return CommResult("fullmesh_allreduce_twoshot", n, bufs, rec.steps, elem_bytes)
+
+
+def fullmesh_all2all(inputs: Sequence[Sequence[Number]], elem_bytes: int = DEFAULT_ELEM_BYTES) -> CommResult:
+    """Full-mesh All2All：1 步，rank r 把第 j 段直接写到 rank j 的第 r 段。
+
+    与 pairwise 的总字节相同；pairwise 用 N-1 步错开对端以避免端口冲突，
+    full-mesh 依赖交换机让 N-1 条流同时进行。
+    """
+    n, length = _validate_equal_buffers(inputs)
+    if length % n != 0:
+        raise ValueError(f"all2all 要求 buffer 长度 {length} 能被 rank 数 {n} 整除")
+    k = length // n
+    outputs = [[None] * length for _ in range(n)]
+    record = StepRecord(index=0, phase="fullmesh-all2all", nranks=n)
+    for r in range(n):
+        for j in range(n):
+            outputs[j][r * k : (r + 1) * k] = list(inputs[r][j * k : (j + 1) * k])
+            if j != r:
+                record.transfers.append(Transfer(r, j, k))
+    steps = [record] if n > 1 else []
+    return CommResult("fullmesh_all2all", n, outputs, steps, elem_bytes)
 
 
 # ---------------------------------------------------------------------------

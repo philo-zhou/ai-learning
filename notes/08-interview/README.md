@@ -11,6 +11,7 @@
 | 文件 | 内容 |
 |---|---|
 | [01-question-bank.md](01-question-bank.md) | 题库：RDMA、算法与代价模型、NCCL 原理、scale-up、通算融合、框架集成、性能排查、项目表述 |
+| [手写 Ring / Full-mesh](../03-ccl-algorithms/05-handwrite-ring-fullmesh.md) | 白板编码题：Ring 与 Full-mesh 各原语的伪代码、GPU one-shot / two-shot kernel、追问与答案 |
 
 ## 与 JD 的对应
 

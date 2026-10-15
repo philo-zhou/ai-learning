@@ -14,10 +14,11 @@
 | [02-alpha-beta-model.md](02-alpha-beta-model.md) | α-β(-γ) 模型；Ring、Double Binary Tree、Recursive Doubling、Halving-Doubling、Bruck、分层算法的推导；algbw 与 busbw | 给定 n、M、α、β，哪种算法更快；busbw 为什么乘 2(n-1)/n |
 | [03-nccl-algorithms.md](03-nccl-algorithms.md) | NCCL 的 Ring / Tree / CollNet / NVLS / PAT 算法和 LL / LL128 / Simple 协议；`src/tuning/`、`src/enqueue/`、`src/device/` 源码导读 | NCCL 怎么在算法×协议之间选；`NCCL_ALGO` / `NCCL_PROTO` 怎么生效 |
 | [04-all2all.md](04-all2all.md) | All2All 的 pairwise、直接 P2P、Bruck、分层算法；MoE dispatch/combine 的特殊性 | 为什么 MoE All2All 难优化；NCCL 的 `ncclAlltoAll` 是怎么实现的 |
+| [05-handwrite-ring-fullmesh.md](05-handwrite-ring-fullmesh.md) | **手写题**：Ring AllReduce / RS / AG、Full-mesh RS / AG / All2All 的 MPI 伪代码；Full-mesh one-shot / two-shot AllReduce 的 GPU kernel 伪代码（IPC + flag 屏障，对照 vLLM custom allreduce） | 面试白板上怎么写、下标怎么推、怎么避免死锁、何时选 Ring 或 Full-mesh |
 
 ## 配套实验
 
-`labs/ccl_sim/`（说明见 [labs/README.md](../../labs/README.md)）：用 Python list 模拟 N 个 rank 的 buffer，逐 step 执行 Ring、Recursive Doubling、Halving-Doubling、Binary Tree AllReduce 和 Pairwise All2All，并用 α-β 模型对比耗时。
+`labs/ccl_sim/`（说明见 [labs/README.md](../../labs/README.md)）：用 Python list 模拟 N 个 rank 的 buffer，逐 step 执行 Ring、Recursive Doubling、Halving-Doubling、Binary Tree、Full-mesh（one-shot / two-shot）AllReduce，以及 Pairwise / Full-mesh All2All，并用 α-β 模型对比耗时。
 
 ```bash
 python3 -m unittest discover -s labs -t .   # 正确性、step 数、发送量、"公式 = 模拟记录"一致性

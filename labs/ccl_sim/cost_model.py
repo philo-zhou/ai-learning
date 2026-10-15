@@ -243,6 +243,48 @@ def bruck_all2all(n: int, nbytes: float, alpha: float, beta: float) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Full-mesh（机内 NVSwitch：一个 step 内同时与 N-1 个对端交换，共享本 rank 的端口带宽）
+# ---------------------------------------------------------------------------
+
+
+def fullmesh_allreduce_oneshot(n: int, nbytes: float, alpha: float, beta: float, gamma: float = 0.0) -> float:
+    """One-shot：α + (n-1)·Mβ + (n-1)·Mγ。1 个 α，但字节是 Ring 的约 n/2 倍。"""
+    _check(n, nbytes, alpha, beta, gamma)
+    if n == 1:
+        return 0.0
+    return alpha + (n - 1) * nbytes * (beta + gamma)
+
+
+def fullmesh_allreduce_twoshot(n: int, nbytes: float, alpha: float, beta: float, gamma: float = 0.0) -> float:
+    """Two-shot（RS + AG）：2α + 2(n-1)/n·Mβ + (n-1)/n·Mγ。β 项与 Ring 相同，α 只有 2 个。"""
+    _check(n, nbytes, alpha, beta, gamma)
+    if n == 1:
+        return 0.0
+    return 2 * alpha + 2 * (n - 1) / n * nbytes * beta + (n - 1) / n * nbytes * gamma
+
+
+def fullmesh_reduce_scatter(n: int, nbytes: float, alpha: float, beta: float, gamma: float = 0.0) -> float:
+    """Full-mesh ReduceScatter：α + (n-1)/n·M(β+γ)，M 为每 rank 输入大小。"""
+    _check(n, nbytes, alpha, beta, gamma)
+    if n == 1:
+        return 0.0
+    return alpha + (n - 1) / n * nbytes * (beta + gamma)
+
+
+def fullmesh_allgather(n: int, nbytes: float, alpha: float, beta: float) -> float:
+    """Full-mesh AllGather：α + (n-1)/n·Mβ，M 为每 rank 输出总大小。"""
+    _check(n, nbytes, alpha, beta)
+    if n == 1:
+        return 0.0
+    return alpha + (n - 1) / n * nbytes * beta
+
+
+def fullmesh_all2all(n: int, nbytes: float, alpha: float, beta: float) -> float:
+    """Full-mesh All2All：α + (n-1)/n·Mβ，M 为每 rank 发送总大小。"""
+    return fullmesh_allgather(n, nbytes, alpha, beta)
+
+
+# ---------------------------------------------------------------------------
 # algbw / busbw（口径对照 third_party/nccl-tests/doc/PERFORMANCE.md）
 # ---------------------------------------------------------------------------
 
@@ -302,4 +344,6 @@ ALLREDUCE_MODELS: Dict[str, Callable[[int, float, float, float], float]] = {
     "halving_doubling": halving_doubling_allreduce,
     "binary_tree": binary_tree_allreduce,
     "dbtree_pipe": double_binary_tree_allreduce,
+    "fm_oneshot": fullmesh_allreduce_oneshot,
+    "fm_twoshot": fullmesh_allreduce_twoshot,
 }
