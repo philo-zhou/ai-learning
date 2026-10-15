@@ -64,6 +64,30 @@
 - 避免：认为 device-initiated 通信只能用 NVSHMEM——本地 DeepEP V2.5 已改用 NCCL GIN。
 - 相关代码或契约：`third_party/nccl/docs/userguide/source/usage/deviceapi.rst`、`third_party/nccl/docs/contrib/GIN/`、`notes/06-comm-compute-fusion/03-nvshmem-and-device-initiated.md`
 
+### dispatch / combine（EP）
+
+- 定义：MoE 专家并行中的两次 All-to-All-v。dispatch 按 top-k 路由把 token 发到专家所在 rank 并按专家排布；combine 把专家输出送回 token 原 rank 并按门控权重求和。
+- 避免：把它当成普通 `ncclAlltoAll`——数据量由每步路由动态决定，且与 token 重排、加权求和融合在同一 kernel。
+- 相关代码或契约：`notes/09-ep-kernels/README.md`、`third_party/DeepEP-hybrid-ep/csrc/kernels/internode_ll.cu`
+
+### LL / HT（low-latency / high-throughput）
+
+- 定义：EP 通信的两类 kernel。LL 面向 decode：直连、固定容量缓冲、无 CPU 同步、可 CUDA Graph；HT（DeepEP 叫 normal）面向训练与 prefill：跨节点 RDMA + 节点内 NVLink 分层，追求带宽。
+- 避免：认为 LL 一定"纯 RDMA"——DeepEP LL 在对端可经 NVLink 访问时会直接 store。
+- 相关代码或契约：`notes/09-ep-kernels/02-deepep-low-latency.md`、`third_party/nccl/contrib/nccl_ep/include/ep_enums.h`
+
+### Hybrid-EP
+
+- 定义：NVIDIA 在 DeepEP `hybrid-ep` 分支实现的高吞吐 EP：先 AllGather 路由并预计算每个 token 的落点，跨节点只发给同 local rank 的 peer，再经 NVLink 扇出，用 TMA warp 专业化流水线降低 SM 占用。
+- 避免：与 DeepEP V2.5 的 `allow_hybrid_mode`（RDMA+NVLink 分层模式）和 NCCL EP 的 `hybrid_ep.cuh`（Hybrid-EP 的 NCCL 移植）混为一谈；三者都指"分层"，但实现不同。
+- 相关代码或契约：`third_party/DeepEP-hybrid-ep/csrc/hybrid_ep/`、`notes/09-ep-kernels/03-hybrid-ep.md`、`notes/09-ep-kernels/04-lineage-and-selection.md`
+
+### IBGDA
+
+- 定义：InfiniBand GPUDirect Async，GPU 线程直接在网卡 SQ 中写 WQE、更新 doorbell record 并写 BlueFlame 寄存器发起 RDMA，不经过 CPU。
+- 避免：认为 IBGDA 改变了网卡侧的 RC 协议——网卡看到的 WQE 和门铃与 CPU 发起时相同，变的只是提交者。
+- 相关代码或契约：`third_party/DeepEP-hybrid-ep/csrc/kernels/ibgda_device.cuh`
+
 ## 术语关系
 
 | 关系 | 说明 |

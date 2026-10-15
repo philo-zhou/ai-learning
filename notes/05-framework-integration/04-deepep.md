@@ -1,16 +1,17 @@
 # DeepEP：MoE dispatch/combine 专用通信库
 
-> 层次：上层（跨中层） · 来源：third_party/DeepEP@93eb6eb（V2.5，`deep_ep/__init__.py` 中 `__version__ = '2.5.0'`）、third_party/nccl@3e46c08（GIN / device API / `contrib/nccl_ep`）、third_party/vllm@02653fa 与 third_party/sglang@d2a4364（V1 API 调用点）、ai-infra-book 第 6、7、9 章
+> 层次：上层（跨中层） · 来源：third_party/DeepEP@93eb6eb（V2.5，`deep_ep/__init__.py` 中 `__version__ = '2.5.0'`）、third_party/DeepEP-hybrid-ep@10d4dd73（`hybrid-ep` 分支，含 V1 源码与 Hybrid-EP）、third_party/nccl@3e46c08（GIN / device API / `contrib/nccl_ep`）、third_party/vllm@02653fa 与 third_party/sglang@d2a4364（V1 API 调用点）、ai-infra-book 第 6、7、9 章
+
+> **kernel 级细节已移到 [09-ep-kernels](../09-ep-kernels/README.md)**：LL 的槽位、信号、IBGDA 与 recv hook 见 [02](../09-ep-kernels/02-deepep-low-latency.md)，Hybrid-EP 见 [03](../09-ep-kernels/03-hybrid-ep.md)。本篇保留框架视角与 V2.5 的接口说明。
 
 ## 一句话
 
-DeepEP 把 MoE 的“按路由把 token 发给专家（dispatch）+ 把专家输出加权送回（combine）”做成 GPU 端发起的专用 All-to-All kernel：V1 用 NVSHMEM（normal：NVLink+RDMA 分层转发；low-latency：纯 RDMA IBGDA + recv hook），本地的 V2.5 已改用 NCCL GIN 后端并把两种模式统一进 `EPBuffer`。
+DeepEP 把 MoE 的“按路由把 token 发给专家（dispatch）+ 把专家输出加权送回（combine）”做成 GPU 端发起的专用 All-to-All kernel：V1 用 NVSHMEM（normal：NVLink+RDMA 分层转发；low-latency：IBGDA 直连 + recv hook），本地的 V2.5 已改用 NCCL GIN 后端并把两种模式统一进 `EPBuffer`。
 
 ## 重要版本说明（先读）
 
-- 本地 `third_party/DeepEP@93eb6eb` 是 **V2.5**。README 明确：“Fully remove V1, including its APIs, NVSHMEM backend, and legacy documentation. NVSHMEM is no longer a dependency”，并且 “EP dispatch and combine require GPU SMs; zero-SM RDMA EP is not supported”。
-- 因此任务中提到的 V1 文件（`csrc/kernels/intranode.cu`、`internode.cu`、`internode_ll.cu`、`deep_ep/buffer.py` 等）**在本地不存在**。下文 V1 部分只写概念；V1 的 Python API 名字能在本地 vLLM/SGLang 的调用点看到，引用的是调用点。
-- 待确认：V1 源码结构与 kernel 角色名；确认方式：`git clone https://github.com/deepseek-ai/DeepEP` 后 checkout V2 之前的 tag/commit，查 `csrc/kernels/` 与 `deep_ep/buffer.py`。
+- `third_party/DeepEP@93eb6eb` 是 **V2.5**。README 明确：“Fully remove V1, including its APIs, NVSHMEM backend, and legacy documentation. NVSHMEM is no longer a dependency”，并且 “EP dispatch and combine require GPU SMs; zero-SM RDMA EP is not supported”。
+- V1 源码已另行拉取到 `third_party/DeepEP-hybrid-ep`（上游 `hybrid-ep` 分支 @10d4dd73，2026-10-15 加入 `repos.lock`）：`csrc/kernels/intranode.cu`、`internode.cu`、`internode_ll.cu`、`ibgda_device.cuh`、`deep_ep/buffer.py` 都在其中，另含 NVIDIA 的 Hybrid-EP（`csrc/hybrid_ep/`）。注意这是一个持续开发的分支，与 vLLM/SGLang 对接的 V1 版本可能有出入（例如 vLLM 传入的 `allow_mnnvl` 在这个分支的 `Buffer.__init__` 中不存在）。
 - 框架侧版本错配：vLLM/SGLang 仍在调用 V1 `deep_ep.Buffer`（HT/LL）与 V2 早期的 `deep_ep.ElasticBuffer`（`third_party/vllm/vllm/distributed/device_communicators/all2all.py` `DeepEPV2All2AllManager`），而 V2.5 已改名为 `EPBuffer`。ai-infra-book 也记录了这一点（`third_party/ai-infra-book/manuscripts/09-分布式推理.md` 9.4.3：“V2 的公开接口使用 ElasticBuffer，底层采用 NCCL Gin……并移除了 V1 中不占用 SM、直接经 RDMA 收发的低延迟 EP 通信路径”）。
 
 ## 在调用链中的位置
@@ -48,12 +49,12 @@ NVLink（scale-up） / InfiniBand（scale-out，推荐自适应路由、独立 V
 - 跨节点：**两跳转发**——token 先经 RDMA 发到远端节点上“同 local rank 号”的 GPU（rail 对齐，只用同号网卡、避免跨轨），再由它经 NVLink 转发给该节点内真正持有专家的 GPU。这样跨节点流量按节点聚合（同一 token 发往一个节点的多个 GPU 只走一次 RDMA），NVLink 带宽用于节点内扇出。
 - 需要 CPU 同步拿到接收计数来分配输出张量（vLLM 注释：“the dispatch kernel will block the CPU”，见 `deepep_ht.py`），因此不适合 CUDA Graph。
 - 占用一定数量 SM 作为通信 warp（`Buffer.set_num_sms`，V1；vLLM `DeepEPAll2AllManagerBase` 中 `num_sms = 20`）。
-- 待确认：V1 中 RDMA sender / forwarder / NVL receiver 的 warp 角色划分；确认方式：V1 源码 `csrc/kernels/internode.cu`。
+- warp 角色（已核实）：`third_party/DeepEP-hybrid-ep/csrc/kernels/internode.cu` 的 `enum class WarpRole` 定义了 `kRDMASender`、`kRDMASenderCoordinator`、`kRDMAAndNVLForwarder`、`kForwarderCoordinator`、`kNVLReceivers` 五种角色；接收计数经 `notify_dispatch` 写入零拷贝 host 内存 `moe_recv_counter`，CPU 轮询后才分配输出（见 [09/01](../09-ep-kernels/01-design-space.md)）。
 
 ### 3. V1 low-latency kernel —— 概念
 
 - 场景：推理 decode，每 rank 只有几十到一百多 token，追求延迟、要求可被 CUDA Graph 捕获。
-- **纯 RDMA**：所有跨 rank 传输（包括节点内）都走 RDMA，避免 NVLink 转发的额外同步；用 **IBGDA**（GPU 直接写 NIC doorbell，绕过 CPU proxy）发起 put。
+- **直连**：每个 (token, top-k 专家) 一次传输，不经节点内转发；跨节点用 **IBGDA**（GPU 直接写 NIC doorbell，绕过 CPU proxy）发起 put。早期版本节点内也走 RDMA；PR #173 之后，对端可经 NVLink P2P 访问时改为直接 store（`nvshmemi_get_p2p_ptr`，由 `allow_nvlink_for_low_latency_mode` 控制）。
 - **固定容量 buffer**：按 `num_max_dispatch_tokens_per_rank` 预分配（SGLang `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` 默认 128），输出形状固定 → 无 CPU 同步、可 CUDA Graph。
 - **hook 式通算重叠**：`low_latency_dispatch(..., return_recv_hook=True)` 只发出 RDMA 写就返回，返回一个 `hook`；调用方先去做其他计算（如另一个 micro-batch 的 attention），稍后调用 `hook()` 才执行接收端等待/整理。发出与接收之间**不占用 SM**（数据由 NIC 搬运）。调用点：`third_party/vllm/vllm/model_executor/layers/fused_moe/prepare_finalize/deepep_ll.py`（`return_recv_hook=True`）、`third_party/sglang/python/sglang/srt/layers/moe/token_dispatcher/deepep.py`（`hook() if self.return_recv_hook else event.current_stream_wait()`）。
 - 代价：同节点流量也走网卡，带宽不如 NVLink；buffer 按最大 token 数预留，显存大。
@@ -69,7 +70,7 @@ NVLink（scale-up） / InfiniBand（scale-out，推荐自适应路由、独立 V
 
 ### 5. 与 NVSHMEM 的关系
 
-- V1：NVSHMEM 提供对称堆（每个 rank 相同偏移的 buffer）、GPU 端 put/get/signal 与 IBGDA 传输，DeepEP 在其上写 kernel；DeepEP 需要打补丁/特定版本的 NVSHMEM（待确认具体版本与补丁；确认方式：V1 源码 `third-party/` 与安装文档）。
+- V1：NVSHMEM 提供对称堆（每个 rank 相同偏移的 buffer）、GPU 端 put/get/signal 与 IBGDA 传输，DeepEP 在其上写 kernel。`hybrid-ep` 分支的 `third_party/DeepEP-hybrid-ep/third-party/README.md` 要求 NVSHMEM 3.3.9 及以上（上游版本即可），目录中仍保留 `nvshmem.patch`；IBGDA 的设备侧代码改编自 NVSHMEM，放在 `csrc/kernels/ibgda_device.cuh`。
 - V2.5：不依赖 NVSHMEM。对称内存由 `ncclMemAlloc` 或 `cuMemCreate/cuMemMap` 分配并 `ncclCommWindowRegister` 注册；NVLink 对端指针来自 `ncclGetLsaDevicePointer`，NVLS multimem 指针来自 `ncclGetLsaMultimemDevicePointer`；RDMA 用 GIN 的 put / signal。等价地说，NCCL 2.3x 的 device API 吸收了“NVSHMEM 式”的 GPU 发起通信能力。
 
 ### 6. 为什么 MoE All2All 是 CCL 的新挑战
@@ -133,7 +134,7 @@ NCCL 侧对应：`third_party/nccl/src/include/nccl_device/core.h`（`NCCL_GIN_T
 
 ## 待深入
 
-- 待确认：V1 `csrc/kernels/internode.cu` 中 normal 模式的 channel/warp 角色与 `internode_ll.cu` 的 IBGDA 调用；确认方式：克隆 deepseek-ai/DeepEP 并 checkout V1 版本。
+- 已完成：V1 normal 的 warp 角色与 `internode_ll.cu` 的 IBGDA 调用，见 [09-ep-kernels](../09-ep-kernels/README.md)；NCCL EP 与 DeepEP 的对应关系见 [09/04](../09-ep-kernels/04-lineage-and-selection.md)。
 - 读 `third_party/DeepEP/deep_ep/include/deep_ep/impls/ep/hybrid_dispatch.cuh` 全文，画出 scaleout/forward warp 的数据流与 signal 时序。
 - 读 `third_party/nccl/contrib/nccl_ep/README.md` 与 `device/ll_ep.cuh`、`device/hybrid_ep.cuh`，对比 NCCL EP 与 DeepEP 的 API 与算法。
 - 读 `third_party/nccl/src/transport/net_ib/gdaki/` 理解 GIN 的 GDAKI 实现与 IBGDA 的对应关系（可并入 `06-comm-compute-fusion/`）。

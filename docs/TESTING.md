@@ -10,6 +10,7 @@
 | unit | 算法模拟器结果错误、步数/通信量不符合理论 | `labs/ccl_sim/tests/` | `python3 scripts/check_repo.py labs` | Python 3 | 模拟的 AllReduce/All2All 与朴素实现一致；步数与通信量符合推导；非法输入报错 | 真实 GPU/网络上的性能；NCCL 的真实行为 |
 | third-party 核对 | 外部资料缺失或版本漂移，导致笔记引用失效 | `scripts/fetch_third_party.sh` | `python3 scripts/check_repo.py third-party` | setup 已完成 | 每个外部仓库 HEAD 等于 `repos.lock` | 上游是否有新版本 |
 | manual：源码对照 | 笔记把函数、路径、环境变量写错 | `notes/` | 在 `third_party/` 中 `grep -rn <符号>` | setup 已完成 | 被抽查的引用真实存在 | 未抽查部分 |
+| 站点构建 | 站内死链、笔记页面缺失、公式未渲染、未渲染文件的链接未改写、中文分词失效 | `site/scripts/verify.mjs`（由 `npm run build` 调用） | `cd site && npm run build` | Node；已 `npm install` | VitePress 构建成功、无站内死链；每篇笔记都有对应页面；`00-start-here` 公式渲染；`labs/README.md` 链接被改写为 GitHub；tokenizer 产出中文双字词 | 视觉效果（需截图人工检查）；浏览器中的交互 |
 | GPU/RDMA 实验 | 对性能结论只停留在纸面 | nccl-tests、perftest | 见 `notes/07-perf-troubleshooting/README.md` | GPU、RDMA 网卡 | 真实带宽/延迟 | — 本机默认 `not-run` |
 
 ## 变更与验证矩阵
@@ -19,6 +20,7 @@
 | 新增/修改笔记 | `python3 scripts/check_repo.py docs` | 抽查新引用的源码路径 | `python3 scripts/check_repo.py` | 移动或重命名章节时 |
 | 修改 `labs/` | `python3 -m unittest discover -s labs -t .` | `python3 -m labs.ccl_sim` | `python3 scripts/check_repo.py` | 改动 cost model 公式时同步核对 `notes/03-ccl-algorithms/02-alpha-beta-model.md` |
 | 修改 `repos.lock` | `python3 scripts/check_repo.py third-party` | 复核引用该仓库的笔记 | `python3 scripts/check_repo.py` | 任何版本升级 |
+| 修改 `site/` 或新增章节 | `cd site && npm run build` | 浏览器打开首页与一篇笔记检查样式 | `cd site && npm run build` 且 `python3 scripts/check_repo.py` | 改 `content.mts` 白名单或主题 CSS 时截图核对 |
 | 修改 `scripts/` | 对应 mode 的正常与非法参数各跑一次（非法 mode 必须退出 2） | — | `python3 scripts/check_repo.py` | — |
 
 ## Fixture、Mock 与隔离

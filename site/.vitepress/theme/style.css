@@ -1,0 +1,156 @@
+/* 技术手册风：暖白纸面、衬线正文、靛蓝主色；三层知识各一种颜色。只用系统字体，离线可用。 */
+
+:root {
+  --ccl-font-serif: "Source Han Serif SC", "Noto Serif CJK SC", "Songti SC", "STSong", Georgia, serif;
+  --vp-font-family-base: "PingFang SC", "Source Han Sans SC", "Noto Sans CJK SC", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --vp-font-family-mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+
+  --ccl-lower: #b5652b;
+  --ccl-middle: #3b4a9c;
+  --ccl-upper: #2f7d74;
+  --ccl-practice: #8a8579;
+  --ccl-overview: #8a8579;
+
+  --vp-c-bg: #faf8f3;
+  --vp-c-bg-alt: #f3f0e8;
+  --vp-c-bg-soft: #f1ede4;
+  --vp-c-bg-elv: #fdfcf9;
+  --vp-c-text-1: #2b2a27;
+  --vp-c-text-2: #5c5a54;
+  --vp-c-text-3: #8f8b82;
+  --vp-c-divider: #e3ddd0;
+  --vp-c-gutter: #e3ddd0;
+  --vp-c-border: #d8d1c2;
+
+  --vp-c-brand-1: #3b4a9c;
+  --vp-c-brand-2: #4d5cb0;
+  --vp-c-brand-3: #3b4a9c;
+  --vp-c-brand-soft: rgba(59, 74, 156, 0.1);
+
+  --vp-code-bg: #f0ece2;
+  --vp-code-block-bg: #f3efe6;
+  --vp-code-color: #7a3e1d;
+  --vp-sidebar-bg-color: #f5f2ea;
+  --vp-nav-bg-color: rgba(250, 248, 243, 0.92);
+  --vp-local-search-bg: #faf8f3;
+}
+
+.dark {
+  --ccl-lower: #e0955c;
+  --ccl-middle: #8c9bea;
+  --ccl-upper: #5fbfb2;
+  --ccl-practice: #a7a297;
+  --ccl-overview: #a7a297;
+
+  --vp-c-bg: #141821;
+  --vp-c-bg-alt: #10131a;
+  --vp-c-bg-soft: #1b2030;
+  --vp-c-bg-elv: #1b2030;
+  --vp-c-text-1: #d9d6cf;
+  --vp-c-text-2: #a9a59c;
+  --vp-c-text-3: #7d796f;
+  --vp-c-divider: #2a3042;
+  --vp-c-gutter: #0d1016;
+  --vp-c-border: #333a4f;
+
+  --vp-c-brand-1: #8c9bea;
+  --vp-c-brand-2: #a3b0f0;
+  --vp-c-brand-3: #6f7fd6;
+  --vp-c-brand-soft: rgba(140, 155, 234, 0.14);
+
+  --vp-code-bg: #1f2536;
+  --vp-code-block-bg: #181d2a;
+  --vp-code-color: #e8b48c;
+  --vp-sidebar-bg-color: #10131a;
+  --vp-nav-bg-color: rgba(20, 24, 33, 0.92);
+  --vp-local-search-bg: #141821;
+}
+
+/* ---------- 正文排版 ---------- */
+
+.vp-doc {
+  font-family: var(--ccl-font-serif);
+  font-size: 16.5px;
+  line-height: 1.8;
+}
+.VPDoc .content-container { max-width: 760px !important; }
+
+.vp-doc h1, .vp-doc h2, .vp-doc h3, .vp-doc h4 {
+  font-family: var(--vp-font-family-base);
+  letter-spacing: 0.01em;
+}
+.vp-doc h1 { font-size: 30px; line-height: 1.35; font-weight: 700; }
+.vp-doc h2 {
+  font-size: 22px; margin-top: 52px; padding-top: 20px;
+  border-top: 1px solid var(--vp-c-divider);
+}
+.vp-doc h3 { font-size: 18px; margin-top: 34px; }
+.vp-doc p, .vp-doc li { text-align: left; }
+.vp-doc li + li { margin-top: 4px; }
+.vp-doc strong { color: var(--vp-c-text-1); font-weight: 650; }
+.vp-doc a { text-underline-offset: 3px; }
+
+.vp-doc blockquote {
+  border-left: 3px solid var(--vp-c-brand-1);
+  background: var(--vp-c-bg-soft);
+  border-radius: 0 6px 6px 0;
+  padding: 10px 18px;
+  color: var(--vp-c-text-2);
+  font-size: 15px;
+}
+.vp-doc blockquote > p { margin: 6px 0; }
+
+/* 表格：可横向滚动，表头浅底 */
+.vp-doc table {
+  display: block; overflow-x: auto;
+  font-family: var(--vp-font-family-base);
+  font-size: 14px; line-height: 1.6;
+  border-collapse: collapse;
+}
+.vp-doc th { background: var(--vp-c-bg-soft); font-weight: 600; white-space: nowrap; }
+.vp-doc tr:nth-child(2n) { background: transparent; }
+.vp-doc th, .vp-doc td { border: 1px solid var(--vp-c-divider); padding: 7px 12px; }
+
+/* 代码：ASCII 图不换行、可横向滚动 */
+.vp-doc :not(pre) > code { font-size: 0.86em; padding: 2px 5px; border-radius: 4px; }
+.vp-doc div[class*="language-"] { border-radius: 6px; border: 1px solid var(--vp-c-divider); }
+.vp-doc div[class*="language-"] code { font-size: 13px; line-height: 1.6; }
+.vp-doc .language-text pre, .vp-doc div[class*="language-"] pre { white-space: pre; overflow-x: auto; }
+
+/* 公式 */
+.vp-doc mjx-container[display="true"] { overflow-x: auto; overflow-y: hidden; padding: 4px 0; }
+
+/* ---------- 侧边栏三层色标 ---------- */
+
+.layer-dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 2px;
+  margin-right: 8px; vertical-align: 1px; flex-shrink: 0;
+}
+.layer-overview { background: var(--ccl-overview); }
+.layer-lower { background: var(--ccl-lower); }
+.layer-middle { background: var(--ccl-middle); }
+.layer-upper { background: var(--ccl-upper); }
+.layer-practice { background: var(--ccl-practice); }
+.VPSidebarItem.level-0 > .item .text { font-weight: 600; font-size: 13.5px; }
+.VPSidebarItem.level-1 .text { font-size: 13.5px; line-height: 1.5; }
+
+/* ---------- 首页 ---------- */
+
+.VPHome .VPHero .name, .VPHome .VPHero .text {
+  font-family: var(--vp-font-family-base);
+  letter-spacing: 0.01em;
+}
+.VPHome .VPHero .name,
+.VPHome .VPHero .name .clip {
+  background: none; -webkit-text-fill-color: var(--vp-c-text-1); color: var(--vp-c-text-1);
+}
+.VPHome .VPHero .text { color: var(--vp-c-brand-1); }
+@media (min-width: 960px) {
+  .VPHome .VPHero .name { font-size: 52px; line-height: 1.2; }
+  .VPHome .VPHero .text { font-size: 30px; line-height: 1.5; max-width: 760px; }
+}
+.VPHome .VPHero .tagline { font-family: var(--ccl-font-serif); font-size: 17px; line-height: 1.8; max-width: 640px; }
+.VPHome .home-body { padding: 0 24px 96px; }
+@media (min-width: 1200px) {
+  .VPHome .home-body { padding: 0 0 96px; }
+}

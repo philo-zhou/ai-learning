@@ -27,7 +27,7 @@
 bash scripts/fetch_third_party.sh
 ```
 
-按 `third_party/repos.lock` 浅克隆 9 个外部仓库并检出固定 commit；已存在的目录只核对、不覆盖。
+按 `third_party/repos.lock` 浅克隆 10 个外部仓库并检出固定 commit；已存在的目录只核对、不覆盖。
 
 ### 启动
 
@@ -36,6 +36,17 @@ python3 -m labs.ccl_sim
 ```
 
 打印 Ring、Tree、Recursive Doubling、Halving-Doubling 等算法在不同消息大小下的 α-β 耗时估算表。
+
+### 网页阅读（可选）
+
+在线版：<https://philo-zhou.github.io/ai-learning/>（`main` 上的笔记更新后由 `.github/workflows/deploy-site.yml` 自动构建发布）。本地运行：
+
+```bash
+cd site && npm install   # 首次，需联网
+npm run dev              # 打开终端打印的本地地址
+```
+
+用 VitePress 直接渲染 `notes/` 与 `docs/references/`：章节侧边栏、中文全文搜索、公式渲染、暗色模式。`npm run build` 构建静态站点并自检。需要 Node（已在 v24 上验证）。
 
 ### 验证第一次成功
 
@@ -56,7 +67,8 @@ python3 scripts/check_repo.py
 
 | 目录 | 内容 |
 |---|---|
-| `notes/` | 按层组织的学习笔记（00 路线 · 01 RDMA · 02 scale-up · 03 算法 · 04 NCCL 内部 · 05 框架集成 · 06 通算融合 · 07 性能排查 · 08 面试） |
+| `notes/` | 按层组织的学习笔记（00 路线 · 01 RDMA · 02 scale-up · 03 算法 · 04 NCCL 内部 · 05 框架集成 · 06 通算融合 · 07 性能排查 · 08 面试 · 09 EP 专用库） |
+| `site/` | VitePress 学习站点：直接渲染 `notes/`，不存放笔记副本 |
 | `labs/` | 可运行实验：集合通信算法模拟器与 α-β 代价模型 |
 | `third_party/` | 固定版本的外部资料（不纳入本仓库 Git） |
 | `scripts/` | setup 与 verify 入口 |

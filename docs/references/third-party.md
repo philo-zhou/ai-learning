@@ -3,7 +3,7 @@
 - 来源：见下表各上游组织
 - URL：见 `third_party/repos.lock`
 - 固定版本或 commit：以 `third_party/repos.lock` 为唯一权威
-- 访问时间：2026-10-14
+- 访问时间：2026-10-14（`DeepEP-hybrid-ep` 为 2026-10-15）
 - License：各仓库自带 License，本仓库只做摘要和路径引用
 
 ## 它是什么
@@ -18,6 +18,7 @@
 | `vllm` | 上层 | `02653fa2` | 主流推理框架，含 pynccl、custom allreduce、EP all2all |
 | `sglang` | 上层 | `d2a43644` | 另一主流推理框架，用于对比通信层设计 |
 | `DeepEP`（deepseek-ai） | 上层/跨层 | `93eb6eb2` | MoE All2All 专用通信库，代表 device-initiated 通信趋势 |
+| `DeepEP-hybrid-ep`（deepseek-ai，`hybrid-ep` 分支） | 中层 | `10d4dd73` | 主线 V2.5 已删除 V1；该分支同时保留 V1 normal/low-latency kernel（`csrc/kernels/internode_ll.cu` 等）与 NVIDIA Hybrid-EP（`csrc/hybrid_ep/`），供 `notes/09-ep-kernels/` 学习 EP 算法。与 `DeepEP` 同一上游 URL，按 commit 拉取；注意 `ibgda_device.cuh` 等文件受 NVSHMEM SLA 约束 |
 | `Triton-distributed`（ByteDance-Seed） | 跨层 | `7908e4ea` | 基于 Triton 的通算融合，对应 JD "利用 Triton 开发通信计算融合算子" |
 
 ## 为什么与本项目有关

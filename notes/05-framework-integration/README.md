@@ -13,7 +13,7 @@
 | [01-parallelism-and-comm-patterns.md](01-parallelism-and-comm-patterns.md) | DP/FSDP/ZeRO、TP、SP、PP、EP、CP 产生的集合通信；训练 vs prefill vs decode；PD 分离 KV 传输 | “这个并行策略会打出什么通信、多大、卡不卡关键路径” |
 | [02-vllm-communication.md](02-vllm-communication.md) | vLLM `GroupCoordinator`、pynccl、custom allreduce、symm mem、all2all 后端、KV connector | “vLLM 里一次 TP AllReduce 到底走了哪条路径” |
 | [03-sglang-communication.md](03-sglang-communication.md) | SGLang 通信层、DP attention、layer_boundary、DeepEP dispatcher、TBO、PD disaggregation | “SGLang 与 vLLM 的通信层哪里同源、哪里分叉” |
-| [04-deepep.md](04-deepep.md) | DeepEP V1 normal / low-latency 概念，与本地 V2.5（NCCL Gin）代码对照 | “MoE All2All 为什么要专用库，它和 NCCL/NVSHMEM 什么关系” |
+| [04-deepep.md](04-deepep.md) | DeepEP V1 normal / low-latency 概念，与本地 V2.5（NCCL Gin）代码对照 | “MoE All2All 为什么要专用库，它和 NCCL/NVSHMEM 什么关系”（kernel 细节见 [09-ep-kernels](../09-ep-kernels/README.md)） |
 | [05-torch-distributed.md](05-torch-distributed.md) | ProcessGroup/ProcessGroupNCCL、comm 创建时机、stream/event、Work、watchdog、`TORCH_NCCL_*` | “hang 了/超时了，PyTorch 这一层发生了什么” |
 
 ## 上层调用链总图

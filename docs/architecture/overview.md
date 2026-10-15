@@ -24,6 +24,7 @@
         │ 调用
 中层  03-ccl-algorithms          Ring / Tree / Halving-Doubling / All2All + α-β 模型
        04-nccl-internals          NCCL：bootstrap、拓扑、channel、协议、proxy、net plugin
+       09-ep-kernels              EP 专用库：DeepEP LL / Hybrid-EP / NCCL EP 的 dispatch/combine kernel
         │ 调用
 下层  02-scale-up                NVLink / NVSwitch / NVLS（P2P、SHM transport）
        01-rdma                    Verbs、RoCEv2/IB、拥塞控制、GPUDirect RDMA
@@ -38,6 +39,8 @@ scripts/fetch_third_party.sh ──读取── third_party/repos.lock ──克
 scripts/check_repo.py ──docs──> notes/ docs/ *.md（链接、占位、源码路径 → third_party/）
                       ──labs──> labs/ccl_sim/tests/
                       ──third-party──> scripts/fetch_third_party.sh check
+site/  VitePress：srcDir=仓库根；content.mts 白名单决定渲染哪些 md（notes/、docs/references/、docs/CONTEXT.md）
+       sidebar.mts 由 notes/ 生成侧边栏；linkRewrite.mts 把未渲染文件的链接改到 GitHub；verify.mjs 构建后自检
 labs/ccl_sim/  algorithms.py（模拟）  cost_model.py（α-β）  __main__.py（对比表）
 ```
 
@@ -49,6 +52,7 @@ labs/ccl_sim/  algorithms.py（模拟）  cost_model.py（α-β）  __main__.py�
 | `labs/` | 可运行实验 | `python3 -m labs.ccl_sim` | Python 标准库 | 第三方包、网络、`third_party/` 代码 | `python3 scripts/check_repo.py labs` |
 | `third_party/` | 固定版本外部资料（只读） | `third_party/repos.lock` | — | 本仓库修改其中内容 | `python3 scripts/check_repo.py third-party` |
 | `scripts/` | setup 与 verify 入口 | `scripts/check_repo.py` | git、Python 标准库 | — | 非法 mode 返回 2 |
+| `site/` | 学习站点（只读渲染 `notes/` 与部分 `docs/`） | `cd site && npm run dev` | `notes/`、`docs/references/`、`docs/CONTEXT.md`；npm 依赖 | 存放笔记副本；读取 `third_party/` | `cd site && npm run build` |
 | `docs/` | 仓库治理文档 | `docs/AGENTS.md` | — | 存放学习笔记正文 | `python3 scripts/check_repo.py docs` |
 
 ## 核心数据流与控制流

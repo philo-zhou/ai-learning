@@ -9,3 +9,4 @@ vllm https://github.com/vllm-project/vllm.git 02653fa22cd1232cd252165b901091bd4a
 sglang https://github.com/sgl-project/sglang.git d2a436446cca3d955358e7b4a5bf6881ea8591cd
 DeepEP https://github.com/deepseek-ai/DeepEP.git 93eb6eb238127e96c6d7a4a625a6dad158348509
 Triton-distributed https://github.com/ByteDance-Seed/Triton-distributed.git 7908e4ea9010bb2238f9f05b28c904fd4b71c60a
+DeepEP-hybrid-ep https://github.com/deepseek-ai/DeepEP.git 10d4dd7377d5bce900fbb4b80cce863764892b95

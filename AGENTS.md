@@ -40,6 +40,8 @@
 |---|---|---|---|---|---|
 | setup | `bash scripts/fetch_third_party.sh` | git、可访问 github.com | 联网；在 `third_party/<name>/` 创建浅克隆；已有目录不覆盖 | 每行 `OK <name> <commit>`，退出码 0 | 缺失/克隆失败/版本不一致退出 1；未知 mode 退出 2 |
 | dev/run | `python3 -m labs.ccl_sim` | Python 3（仅标准库） | 无，只打印 | 输出各算法 α-β 估算表，退出码 0 | 非零即失败 |
+| site | `cd site && npm install`（首次）→ `npm run dev`（阅读）/ `npm run build`（构建并检查） | Node（已在 v24 上验证）；`npm install` 需联网 | 写 `site/node_modules/`、`site/.vitepress/cache|dist/`（均已 gitignore） | dev 打印本地地址；build 末尾打印 `site verify: passed` | 构建失败或站内死链时非零退出；`verify.mjs` 失败退出 1 |
+| site deploy | push 到 `main`（改动 `notes/`、`docs/references/`、`docs/CONTEXT.md`、`site/`）触发 `.github/workflows/deploy-site.yml` | 仓库 Settings → Pages 的 Source 为 GitHub Actions；push 需用户授权 | 对外发布到 https://philo-zhou.github.io/ai-learning/ | Actions 中 build 与 deploy 两个 job 成功 | 任一 job 失败则站点保持上一版本 |
 | verify | 最小：`python3 scripts/check_repo.py docs`；完整：`python3 scripts/check_repo.py` | Python 3；完整模式需 setup 完成 | 只读（运行 unittest 会生成 `__pycache__`，已 gitignore） | 每步打印 `passed`，退出码 0 | 任一步失败退出 1；参数错误退出 2 |
 
 GPU/RDMA 实验（nccl-tests、perftest、vLLM/SGLang/DeepEP/Triton-distributed 示例）本机不可运行：默认 `not-run`，在笔记中写明所需硬件，不得声称跑过。
@@ -68,7 +70,7 @@ GPU/RDMA 实验（nccl-tests、perftest、vLLM/SGLang/DeepEP/Triton-distributed 
 
 | 变化 | 必须检查或更新 |
 |---|---|
-| 新增/移动笔记章节 | `notes/00-roadmap/README.md`、`notes/00-roadmap/00-start-here.md` 第 6 节、对应章节 `README.md`、`docs/architecture/overview.md` |
+| 新增/移动笔记章节 | `site/.vitepress/content.mts` 的 `CHAPTERS`、`notes/00-roadmap/README.md`、`notes/00-roadmap/00-start-here.md` 第 6 节、对应章节 `README.md`、`docs/architecture/overview.md` |
 | 新的外部调研 | `docs/references/YYYY-MM-DD-<topic>.md`（带来源、访问日期、置信度），学习笔记只引用其编号 |
 | 外部资料新增或升级 | `third_party/repos.lock`、`docs/references/third-party.md`、引用该版本的笔记头部 |
 | 执行入口或验证方式 | 本文件执行能力表、`docs/TESTING.md`、`README.md` |

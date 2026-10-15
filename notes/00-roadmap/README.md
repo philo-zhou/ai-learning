@@ -1,6 +1,6 @@
 # 笔记总入口
 
-> 层次：总览 · 来源：third_party/ai-infra-book@3bdcb4fc、third_party/nccl@3e46c089、third_party/vllm@02653fa2、third_party/DeepEP@93eb6eb2
+> 层次：总览 · 来源：third_party/ai-infra-book@3bdcb4fc、third_party/nccl@3e46c089、third_party/vllm@02653fa2、third_party/DeepEP@93eb6eb2、third_party/DeepEP-hybrid-ep@10d4dd73
 
 ## 一句话
 
@@ -16,6 +16,7 @@
 | 下层 scale-up | 机内/超节点内如何搬字节：NVLink/NVSwitch、P2P/SHM、NVLS、CUDA IPC | [02-scale-up](../02-scale-up/README.md) |
 | 中层 算法 | 搬哪些字节、分几轮：Ring/Tree/Halving-Doubling、分层、α-β 代价模型 | [03-ccl-algorithms](../03-ccl-algorithms/README.md) |
 | 中层 实现 | NCCL 如何把算法落到拓扑和硬件：初始化、拓扑、channel、协议、transport、proxy | [04-nccl-internals](../04-nccl-internals/README.md) |
+| 中层 EP 专用库 | MoE dispatch/combine 怎样在 kernel 里落地：DeepEP low-latency、Hybrid-EP、NCCL EP | [09-ep-kernels](../09-ep-kernels/README.md) |
 | 上层 | 框架在何处、以何种语义调用 CCL：PyTorch、vLLM、SGLang、DeepEP | [05-framework-integration](../05-framework-integration/README.md) |
 | 跨层 | 通信与计算如何融合：Triton-distributed、NVSHMEM、对称内存 | [06-comm-compute-fusion](../06-comm-compute-fusion/README.md) |
 | 实践 | 怎么测、怎么调、怎么排查：nccl-tests、perftest、环境变量 | [07-perf-troubleshooting](../07-perf-troubleshooting/README.md) |
@@ -72,7 +73,7 @@
 | IB verbs | `third_party/rdma-core/libibverbs/examples/rc_pingpong.c` | Verbs 最小示例 |
 
 - 待确认：PyTorch DDP / `ProcessGroupNCCL` 的具体文件与函数；本地 `third_party/` 未克隆 PyTorch；确认方式：克隆 pytorch 后查 `torch/csrc/distributed/c10d/`。
-- DeepEP 的依赖方式（已核实）：本地 DeepEP@93eb6eb2 为 V2.5，`third_party/DeepEP/README.md` 写明已移除 V1 与 NVSHMEM 后端，改走 NCCL device API（GIN、`ncclCommWindowRegister`），见 `third_party/DeepEP/csrc/kernels/comm/context.cpp`；图中"NVSHMEM/IBGDA"对应的是 V1 及 Triton-distributed 的路径。详见 [05-framework-integration](../05-framework-integration/README.md) 与 [06-comm-compute-fusion](../06-comm-compute-fusion/README.md)。
+- DeepEP 的依赖方式（已核实）：本地 DeepEP@93eb6eb2 为 V2.5，`third_party/DeepEP/README.md` 写明已移除 V1 与 NVSHMEM 后端，改走 NCCL device API（GIN、`ncclCommWindowRegister`），见 `third_party/DeepEP/csrc/kernels/comm/context.cpp`；图中"NVSHMEM/IBGDA"对应的是 V1 及 Triton-distributed 的路径；V1 源码在 `third_party/DeepEP-hybrid-ep`，kernel 细节见 [09-ep-kernels](../09-ep-kernels/README.md)。详见 [05-framework-integration](../05-framework-integration/README.md) 与 [06-comm-compute-fusion](../06-comm-compute-fusion/README.md)。
 
 ## 本目录文件
 
@@ -94,6 +95,7 @@
 - [06-comm-compute-fusion](../06-comm-compute-fusion/README.md)：通信与计算融合
 - [07-perf-troubleshooting](../07-perf-troubleshooting/README.md)：性能调优与故障排查
 - [08-interview](../08-interview/README.md)：面试题与项目表述
+- [09-ep-kernels](../09-ep-kernels/README.md)：EP 专用通信库（DeepEP LL、Hybrid-EP、NCCL EP）
 
 ## 外部资料与版本
 
@@ -107,6 +109,7 @@
 | perftest | 05200c2f |
 | rdma-core | bd3282a1 |
 | DeepEP | 93eb6eb2 |
+| DeepEP-hybrid-ep | 10d4dd73 |
 | Triton-distributed | 7908e4ea |
 | vllm | 02653fa2 |
 | sglang | d2a43644 |

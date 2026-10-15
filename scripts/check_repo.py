@@ -36,6 +36,9 @@ def markdown_files():
             continue
         if rel.startswith(".git/"):
             continue
+        # 站点依赖与构建产物不是本仓库维护的 Markdown。
+        if rel.startswith(("site/node_modules/", "site/.vitepress/")):
+            continue
         yield path, rel
 
 

@@ -21,6 +21,7 @@
 | `06-comm-compute-fusion/` | 跨层 | 通算融合、Triton-distributed、NVSHMEM |
 | `07-perf-troubleshooting/` | 实践 | nccl-tests、环境变量、性能分析与故障排查 |
 | `08-interview/` | 求职 | 面试题与项目表述 |
+| `09-ep-kernels/` | 中层 | EP 专用通信库：DeepEP low-latency、Hybrid-EP、NCCL EP 的 kernel 设计 |
 
 每个目录有一个 `README.md` 作为章节索引，具体笔记用 `NN-<topic>.md` 命名。
 
