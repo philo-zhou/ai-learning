@@ -24,6 +24,30 @@ GPU kernel 只负责把数据写进（或读出）一块"网络缓冲"并更新�
 
 每个 rank 有自己的 `proxyState`（源码注释：parent comm 与 split 出的子 comm 共享同一个 proxyState，`ncclProxyCreate` 只在 `refCount == 1` 时起线程），线程运行在该 rank 的 GPU 上下文；控制消息通过 `ncclProxyConnect` + `ncclProxyCallBlocking/Async` 发给目标 rank 的 proxy（PXN 时是同节点另一块 GPU 所属 rank 的 proxy）。
 
+下图把三类线程和 GPU kernel 放在一起：用户线程只负责把 proxy op 放进 op 池并 post（CUDA graph 模式下这一步由 `cudaLaunchHostFunc` 回调在每次 replay 时执行），progress 线程与 kernel 之间不直接调用，只通过共享的 `tail/head/connFifo` 内存互相轮询。
+
+```text
+ ┌────────────────────┐                  ┌────────────────────┐
+ │ user thread        │ cuLaunchKernelEx │ GPU kernel         │
+ │ (enqueue / launch) │ ───────────────► │ (primitives)       │
+ └─────────┬──────────┘                  └─────────┬──────────┘
+           │ uploadProxyOps → op pool              │ tail / head / connFifo
+           │ ncclProxyStart → ncclProxyPost        │ (memory polled by proxy)
+           ▼                                       ▼
+ ┌────────────────────────────────────────────────────────────┐
+ │ "NCCL Progress" thread: ncclProxyProgress                  │
+ │   ncclProxyGetPostedOps → ProxyAppend → progressOps        │
+ │   sendProxyProgress / recvProxyProgress                    │
+ └─────────────────────────────┬──────────────────────────────┘
+                               │ ncclNet->isend / irecv / test / iflush
+                               ▼
+                        net plugin → NIC
+
+ control plane (local ranks, or PXN peers):
+   ncclProxyCallBlocking/Async ──► "NCCL Service"  Setup / Connect / Register ...
+   cuMem fd over UDS           ──► "NCCL UDS Svc"  GetFd / QueryFd
+```
+
 ### 为什么需要 CPU proxy
 
 - 传统 verbs 的 post send/recv 和 poll CQ 由 CPU 完成；GPU kernel 不能直接敲网卡门铃（GPU 发起网络是另一条路线，如 GIN/GDAKI，`src/gin/`、`src/transport/net_ib/gdaki/`）。
@@ -34,6 +58,31 @@ GPU kernel 只负责把数据写进（或读出）一块"网络缓冲"并更新�
 - 发送：kernel 把数据写入 `buffs[p]` 的某个 slot 并更新 `tail`（以及 `connFifo[slot].size`）；proxy 在 `sendProxyProgress` 中看到 slot 就绪后 `ncclNet->isend`，`test` 完成后更新 `head`，让 GPU 复用该 slot。
 - 接收：proxy 预先 `irecv` 到 slot；`test` 完成后，若用了 GDR 且需要（`ncclTopoNeedFlush`），调用 `iflush`（或 GDRCopy 的 PCIe 读，源码注释 "Force a PCIe read from GPU memory"）保证网卡写入对 GPU 可见，然后更新 `tail` 通知 kernel。
 - 深度受 `NCCL_STEPS`（8）限制；`NCCL_NET_SHARED_BUFFERS`（`net.cc:170`）决定是否多连接共享 buffer pool。
+
+下图按 `src/transport/net.cc` 中 `sendProxyProgress` / `recvProxyProgress` 的步进游标（`sub->posted/received/transmitted/done`）展开上面两条，左右两侧的 head/tail 就是 [03 第 7 节](03-channels-protocols-kernels.md) 里 `waitPeer/postPeer` 用的那组计数：
+
+```text
+ send side  (Simple, non-shared buffers)
+ send kernel                          send proxy: sendProxyProgress
+ ───────────                          ─────────────────────────────
+ waitPeer(head): free slot?
+   connFifo[slot].size = n
+ write data into slot
+ postPeer: tail = step ─────────────► transmitted: tail > base + transmitted && size != -1
+                                        └ ncclNet->isend(slot)  ═══ to remote ═══►
+                                      done: ncclNet->test() reports done
+ head moves, slot reusable ◄───────────  └ size = -1; head = base + done
+
+ recv side
+ recv proxy: recvProxyProgress                          recv kernel
+ ─────────────────────────────                          ───────────
+ posted:      ncclNet->irecv(slot)
+ received:    ncclNet->test() reports done  ◄═══ from remote
+ transmitted: iflush if needed (GDR)
+              tail = base + transmitted ──────────────► waitPeer(tail): data ready
+                                                        read / reduce slot
+ done:        head > base + done      ◄──────────────── postPeer: head = step
+```
 
 ## 源码导读
 
@@ -86,6 +135,27 @@ GPU kernel 只负责把数据写进（或读出）一块"网络缓冲"并更新�
 - 分层：NET transport（`net.cc`，与网络无关的缓冲/step/proxy 逻辑）→ `ncclNet_t` 函数表 → `net_ib`（QP 建立 `connect.cc`、收发 `p2p.cc` 中 `wrap_ibv_post_send`/`wrap_ibv_poll_cq`、GDR 检测 `gdr.cc`）。
 - 接收端匹配：IB 插件用 RDMA write 把数据直接写到对端 `irecv` 提供的地址，接收方通过一个 FIFO（`ncclIbPostFifo`）先把自己的地址/rkey 告诉发送方，类似 CTS。
 - 外部插件（如 `plugins/net/google-fastsocket`、厂商 RoCE/EFA 插件）替换的是 `net_ib` 这一层，NET transport 与 proxy 逻辑不变。
+
+三层关系如下：NET transport 只认 `ncclNet_t` 函数表；内置 IB/Socket 与外部 `.so` 插件是这张表的不同实现，外部插件先于内置插件尝试加载（第 4 节）：
+
+```text
+ ┌───────────────────────────────────────────────────┐
+ │ NET transport          src/transport/net.cc       │
+ │ setup / connect / sendProxyProgress / recv...     │
+ └─────────────────────────┬─────────────────────────┘
+                           │ proxyState->ncclNet->isend / irecv / test / iflush ...
+ ┌─────────────────────────┴─────────────────────────┐
+ │ ncclNet_t  (= ncclNet_v12_t)                      │
+ │ per-version adapters: src/plugin/net/net_v*.cc    │
+ └──────┬─────────────────────┬──────────────────┬───┘
+        ▼                     ▼                  ▼
+ ┌──────────────┐   ┌────────────────┐   ┌─────────────────────────┐
+ │ ncclNetIb    │   │ ncclNetSocket  │   │ libnccl-net-<name>.so   │
+ │ net_ib/      │   │ net_socket.cc  │   │ symbol ncclNetPlugin_vN │
+ └──────┬───────┘   └────────────────┘   └─────────────────────────┘
+        ▼
+ wrap_ibv_post_send / wrap_ibv_poll_cq  ──► RDMA NIC
+```
 
 ## 性能要点与常见坑
 

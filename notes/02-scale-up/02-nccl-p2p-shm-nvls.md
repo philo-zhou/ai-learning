@@ -13,6 +13,22 @@
 - 下层：CUDA driver API（`cuMemCreate/cuMemExportToShareableHandle/cuMemImportFromShareableHandle/cuMemMap`、`cuMulticast*`）、legacy `cudaIpcGetMemHandle`；设备侧 PTX `multimem.*`。
 - 跨节点部分见 [../04-nccl-internals/04-proxy-and-net-plugin.md](../04-nccl-internals/04-proxy-and-net-plugin.md) 与 [../01-rdma/README.md](../01-rdma/README.md)。
 
+`selectTransport` 对每个 (channel, peer, send/recv) 连接按数组顺序试，第一个 `canConnect` 为真的 transport 立即调用自己的 `setup` 并返回；全部失败就是常见报错 `No transport found for rank X -> rank Y`（`src/transport.cc`）：
+
+```text
+  ncclTransports[] = { p2p, shm, net, collNet }
+
+  ┌─────────┐  no  ┌─────────┐  no  ┌─────────┐  no  ┌─────────┐  no
+  │ p2p     ├─────►│ shm     ├─────►│ net     ├─────►│ collNet ├─────► WARN "No transport found"
+  └────┬────┘      └────┬────┘      └────┬────┘      └────┬────┘       return ncclSystemError
+       │ yes            │ yes            │ yes            │ yes
+       ▼                ▼                ▼                ▼
+   p2p setup        shm setup        net setup       collNet setup
+
+  NVLS is not in this array: built separately at init
+  (ncclNvlsInit -> ncclNvlsSetup -> ncclNvlsBufferSetup)
+```
+
 ## 核心概念
 
 ### CUDA IPC 与 cuMem
@@ -25,6 +41,26 @@
 
 `ncclCuMemEnable()`（`misc/cudawrap.cc:47`）：`NCCL_CUMEM_ENABLE` 默认 -2 表示自动检测。源码注释提醒 legacy IPC 检测"will always fail when using NCCL_CUMEM_ENABLE=1"。
 
+三种句柄从"分配方"到"导入方"的路径（`p2p.cc::ncclP2pAllocateShareableBuffer` 与 `ncclP2pImportShareableBuffer`）。POSIX fd 不能当字节传，所以导入方要把原生 cuMem handle 发回分配方的 proxy，由它转成 fd 再经 Unix socket 送回：
+
+```text
+  owner (p2pSendProxySetup / p2pRecvProxySetup)      importer (p2pMap)
+  ncclP2pAllocateShareableBuffer                     ncclP2pImportShareableBuffer
+  │
+  ├─ legacy IPC: ncclCudaCalloc
+  │              cudaIpcGetMemHandle ───── 64B handle ─────► cudaIpcOpenMemHandle
+  │
+  ├─ cuMem FABRIC: ncclCuMemAlloc
+  │                cuMemExportToShareableHandle ── bytes ──► cuMemImportFromShareableHandle
+  │
+  └─ cuMem POSIX fd: ncclCuMemAlloc
+                     keep native handle ◄── handle ───────── ncclProxyClientGetFdBlocking
+                     (proxy UDS thread) ─── fd via UDS ────► cuMemImportFromShareableHandle(fd)
+
+  both cuMem paths, importer side:  cuMemAddressReserve ──► cuMemMap ──► cuMemSetAccess
+  then: kernel load/store directly on the mapped peer buffer
+```
+
 ### P2P 四种类型（`p2p.cc` 中 `enum p2pType`）
 
 | 类型 | 条件 | 日志（`p2pSendSetup`） |
@@ -35,6 +71,29 @@
 | `P2P_INTERMEDIATE` | 需要经中间 GPU（`intermediateRank != -1`，对应 NVB 路径） | `via P2P/indirect/<rank>` |
 
 后缀 `/read` 表示 P2P read 模式（接收方从发送方显存读，`NCCL_P2P_READ`），否则 write 模式（`NCCL_P2P_WRITE`）；`/CE` 表示用 copy engine（`NCCL_P2P_USE_CUDA_MEMCPY=1`，由 proxy 线程 `p2pSendProxyProgress` 调 `cudaMemcpyAsync`，不占 SM）。
+
+两种模式下缓冲放在哪一侧（`p2pSendSetup` 的 `sendSize` 与 `p2pRecvSetup` 的 `recvSize`）：read 模式只把 SIMPLE 缓冲挪到发送方 `ncclSendMem` 之后，LL/LL128 仍在接收方。
+
+```text
+  write mode (NCCL_P2P_WRITE)
+     sender GPU                          receiver GPU
+     ┌───────────────┐                   ┌───────────────┐
+     │ ncclSendMem   │                   │ ncclRecvMem   │
+     └───────────────┘                   │ LL buffer     │
+       sender kernel ────── store ─────► │ LL128 buffer  │
+                                         │ SIMPLE buffer │
+                                         └───────────────┘
+
+  read mode (NCCL_P2P_READ)
+     sender GPU                          receiver GPU
+     ┌───────────────┐                   ┌───────────────┐
+     │ ncclSendMem   │                   │ ncclRecvMem   │
+     │ SIMPLE buffer │                   │ LL buffer     │
+     └───────┬───────┘                   │ LL128 buffer  │
+             │                           └───────────────┘
+             └──────── load (SIMPLE) ─── receiver kernel
+       (LL / LL128: sender still stores into receiver buffers)
+```
 
 ### SHM
 
@@ -48,6 +107,29 @@
 - multicast 组：`multicast.cc::ncclMcGroupBuildPartitions`：本地 rank 0 `ncclMcCreate`（`cuMulticastCreate`，FABRIC 时导出句柄）→ `bootstrapIntraNodeBroadcast` 分发 → 其他 rank `ncclMcImport` → 每个 rank `cuMulticastAddDevice` → 节点内 barrier（注释：`cuMemMap` 会阻塞到所有设备加入，用 abort 感知的 barrier 防止对端失败导致挂死）→ `cuMemAddressReserve/cuMemMap/cuMemSetAccess` 映射 multicast VA。每块 GPU 的单播（UC）物理内存再通过 `cuMulticastBindMem`（`ncclMcPartitionBindMem`）绑到组里。
 - 通道布局：`ncclNvlsSetup` 中每个 NVLS head、每个 channel 有两对连接，注释 "Reduce UC -> MC" 与 "Broadcast MC -> UC"；`NCCL_NVLS_NCHANNELS`、`NCCL_NVLS_CHUNKSIZE`（默认 128K）可调。
 - 设备侧：`all_reduce.h` 中 `RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_NVLS, NCCL_PROTO_SIMPLE>` 把线程分成 scatter / gather / reduce 几组，reduce 组使用 `ProtoSimple<1, 1, COLL_UNROLL, 1, 1>`（模板参数 `MultimemSrcs=1, MultimemDsts=1`）；`common_kernel.h` 中 `applyLoadMultimem` 发出 `multimem.ld_reduce.relaxed.sys.global.add...`（`reduce_kernel.h:1131`）从 multicast 地址读出"所有 GPU 对应位置之和"，`multimem_st_global`（`op128.h`）发出 `multimem.st.global...` 一次写到所有 GPU。归约在 NVSwitch 中完成，GPU SM 只发起访存。
+
+单节点 NVLS AllReduce 的数据流（`all_reduce.h` 的 `work->oneNode` 分支 + `ncclNvlsSetup` 的缓冲布局）。每个 head h、每个 channel 在同一块已绑定到 multicast 的物理内存上有两个槽，同一块内存既可用 UC 指针（只访问本卡）也可用 MC 指针（访问组内所有卡）：
+
+```text
+  per head h, per channel (nvls.cc: dataUc = UC view, dataPartition = MC view)
+    slot "Reduce UC -> MC"    : written via UC by scatter,  read via MC by reduce
+    slot "Broadcast MC -> UC" : written via MC by reduce,   read via UC by gather
+
+  every GPU                          GPU whose headRank == h          every GPU
+  ─────────                          ───────────────────────          ─────────
+  sendbuff
+     │ scatter warps (UC store)
+     ▼
+  reduce slot h ─────────────►  multimem.ld_reduce(MC addr)
+  (on all GPUs)                   NVSwitch sums slot h of all GPUs
+                                         │ result in registers
+                                         ▼
+                                multimem.st(MC addr) ─────────────► bcast slot h
+                                  NVSwitch writes every GPU         (on all GPUs)
+                                                                       │ gather warps
+                                                                       ▼ (UC load)
+                                                                    recvbuff
+```
 - NVLS_TREE：节点内 NVLS + 节点间 tree，用于多节点。
 - 用户缓冲注册：`ncclCommRegister` 后，NVLS 可直接把用户缓冲绑到 multicast（`nvls_ub.cc::ncclNvlsUbRegister`、`ncclNvlsLocalRegisterBuffer`、`ncclNvlsGraphRegisterBuffer`），省掉拷入/拷出 NCCL 内部缓冲；源码注释"MNNVL does not support NVLS buffer registration"。
 

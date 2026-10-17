@@ -91,6 +91,22 @@ token 按 chunk（默认 64 个 token，NUM_OF_TOKENS_PER_CHUNK_DISPATCH_API）�
 
 **S2G warp（经 NVLink 扇出）**：按 `sparse_to_dense_map`，把 SMEM 里的每个 token 用 TMA 写到节点内每个需要它的 rank 的 `expert_output_token[下标]`（远端缓冲通过 CUDA IPC 或 fabric handle 映射）。一个 token 被同节点多个 rank 需要时，在 SMEM 里只有一份，向多个 rank 各写一次。
 
+下图是一个 dispatch block 内部三类 warp 的数据流（多节点）：RDMA warp 自成一路往外发；G2S 与 S2G 通过 SMEM 环形队列做生产者-消费者，每级一对 mbarrier（源码注释："1st for producer->consumer, 2nd for consumer->producer"）。
+
+```text
+                  ┌──────────────── one dispatch block (1 SM, 4 warps) ──────────────────┐
+ input buffer ────┼─► RDMA warp ── WRITE x tokens + ATOMIC_FA ───────────────────────────┼──► peer rdma buffer
+ (registered)     │                                                                      │    (remote node)
+                  │                                                                      │
+ input buffer ────┼─► G2S warp ─cp.async.bulk─► SMEM ring ─────► S2G warps ──TMA store───┼──► expert_output_token[r]
+ rdma buffer  ────┼─►  (spin on flag)          NUM_OF_STAGES     (2 multi-node)          │    (NVLink, IPC/fabric)
+ (from peers)     │                            full/empty mbar                           │
+                  └──────────────────────────────────────────────────────────────────────┘
+```
+
+- 左侧"rdma buffer"即参数里的 `rdma_inter_node_group_token`，G2S 等的标志是 `rdma_inter_node_group_flags`（按源节点和 chunk 编号定位）；右侧 `expert_output_token[r]` 是节点内各 rank 的输出缓冲指针数组（`hybrid_ep_backend.cuh` 中 `dispatch_kernel_param_t`）。
+- 同一个 block 既是发送方（RDMA warp 把本 rank 的 chunk 发给远端 peer），也是接收方（G2S 消费远端 peer 发来的 chunk）。dispatch 的共享内存结构里，mbarrier 只用于 token 环形队列、`sparse_to_dense_map` 的乒乓缓冲和 S2G 组内同步，RDMA warp 与 G2S/S2G 之间没有 SMEM 交接。
+
 ```text
 节点 A 的 rank 0                         节点 B（peer = rank 0）                节点 B 内其他 rank
  token t ──RDMA WRITE（只发一次）──> B.rank0.rdma_buffer[t] ──TMA/NVLink──> B.rank{1,3,…}.expert_output[dense_idx]
@@ -108,6 +124,26 @@ token 按 chunk（默认 64 个 token，NUM_OF_TOKENS_PER_CHUNK_DISPATCH_API）�
 | RDMA N2N（1 warp） | 等某个 chunk 预归约完（SMEM mbarrier），把它 RDMA WRITE 到 token 原节点的 peer，末尾 ATOMIC 标志 |
 | 节点间 G2S（1 warp） | 读本节点直接算出的结果和远端 peer 发来的预归约结果 |
 | 节点间归约（4 warp） | 做最终归约，经 NVLink 写回 token 原来所在的 rank |
+
+下图按一个跨节点 token 的路径把五类 warp group 串起来（多节点）。每个 block 两条流水都有；对某一个 token 而言，上一行发生在专家所在的节点 B，下一行发生在 token 原节点 A 上的 peer GPU：
+
+```text
+node B (experts)
+                ┌─────────────┐    ┌──────────────┐    ┌──────────────┐
+ expert outputs │ intra G2S   │    │ intra red    │    │ RDMA N2N     │  RDMA WRITE
+ of B's ranks ─►│ (1 warp)    ├───►│ (4 warps)    ├───►│ (1 warp)     ├──+ ATOMIC ──┐
+                └─────────────┘SMEM└──────────────┘    └──────────────┘             │
+                                    FP32 pre-reduce     waits per-chunk mbarrier    │
+                                    → rdma send buf                                 │
+node A (token home, peer GPU)                                                       │
+                ┌─────────────┐    ┌──────────────┐                                 │
+ local results ►│ inter G2S   │    │ inter red    │  TMA / NVLink                   │
+ rdma buffer ──►│ (1 warp)    ├───►│ (4 warps)    ├──────────────► home rank of t   │
+   ▲            └─────────────┘SMEM└──────────────┘                                 │
+   └────────────────────────────────────────────────────────────────────────────────┘
+```
+
+单节点时没有上一行（intra G2S / intra red / RDMA 都不启用），只剩 inter G2S（2 warp）与 inter red（4 warp，两条流水），共 6 个 warp（`combine_kernel` 前的注释）。
 
 - 节点内归约 warp 按"同一个 chunk 号发往各个远端节点，再下一个 chunk 号"的顺序产出，RDMA warp 按相同顺序消费。注释给出的理由是：最终归约需要所有节点的同一个 chunk 号，这样排序能让它们尽早凑齐。
 - 预归约把跨节点 combine 的流量从"每个 (token, 远端专家) 一份"降到"每个 (token, 远端节点) 一份"，和 dispatch 的去重对称。

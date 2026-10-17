@@ -11,6 +11,28 @@ perftest 是"不经过通信库、直接用 verbs 打满网卡"的标尺：先�
 - 与 NCCL 平级，直接调 libibverbs（可选 librdmacm），不经过任何通信库。
 - 在排障链里的位置：`ibv_devinfo`（端口是否 ACTIVE、MTU、link_layer）→ perftest 点对点（单链路能力）→ nccl-tests（集合通信）→ 业务。NCCL 自身也带一个 ib_write_bw 风格的诊断：`third_party/nccl/src/diagnostics/ib_write_bw.cc`（`ncclDiagRunIbWriteBw`，头文件注释说明它"纯观察、不会让 communicator 初始化失败"）。
 
+下图左边是软件栈上的位置（perftest 与 NCCL 平级，都直接调 verbs），右边是排障时逐层往上加变量的顺序：
+
+```text
+  software stack                         troubleshooting order
+  ──────────────                         ─────────────────────
+  ┌──────────────┐ ┌──────────────┐      ┌──────────────┐
+  │ perftest     │ │ NCCL net_ib  │      │ ibv_devinfo  │  ← 端口 ACTIVE、MTU、link_layer
+  └──────┬───────┘ └──────┬───────┘      └──────┬───────┘
+         └───────┬────────┘                     ▼
+          ┌──────┴───────┐               ┌──────────────┐
+          │ libibverbs   │               │ perftest     │  ← 单对、单流：RNIC + 链路本身
+          │ (+librdmacm) │               └──────┬───────┘
+          └──────┬───────┘                      ▼
+          ┌──────┴───────┐               ┌──────────────┐
+          │ RNIC         │               │ nccl-tests   │  ← 加上算法、拓扑、多流并发
+          └──────────────┘               └──────┬───────┘
+                                                ▼
+                                         ┌──────────────┐
+                                         │ workload     │
+                                         └──────────────┘
+```
+
 ## 核心概念
 
 ### 工具清单（`Makefile.am` 中的 `bin_PROGRAMS`）
@@ -73,6 +95,25 @@ client: ib_write_bw -d mlx5_0 -x 3 -q 4 -s 1048576 -D 10 --report_gbits --use_cu
   - SEND/WRITE 是 ping-pong，报告的是 RTT/2（`rtt_factor = 2`）；READ/ATOMIC 是本端发起、读回，报告完整 RTT（`rtt_factor = 1`）。所以 `ib_read_lat` 天然比 `ib_write_lat` 大一倍左右，这不说明 READ 更慢。
   - `ib_write_lat` 的实现是两端互相写对方 buffer 的最后一个字节，然后忙等轮询本地 buffer 尾字节（`run_iter_lat_write`：`post_buf = buf + size - 1`，`while (*poll_buf != (char)rcnt)`）。它依赖"WRITE 按地址顺序落地、最后一个字节最后到"。README 提到 MUSA 显存上的 `ib_write_lat` 必须用 `--write_with_imm`，原因正是 CPU 无法轮询设备内存。
 
+把两种延迟测试的一次迭代并排画出，就能看出 `rtt_factor` 为什么不同：
+
+```text
+ib_write_lat：ping-pong，一次迭代 = 一个来回，报告 RTT / 2（rtt_factor = 2）
+（run_iter_lat_write 中 server 第一轮不先轮询，直接先写）
+
+  server                                   client
+    │── RDMA WRITE (last byte = n) ────────►│  busy-poll: *poll_buf == n
+    │◄──────── RDMA WRITE (last byte = n) ──│
+    │  busy-poll: *poll_buf == n            │
+
+ib_read_lat：一次迭代 = 一个 READ 往返，报告完整 RTT（rtt_factor = 1）
+
+  requester                                responder
+    │── READ request ──────────────────────►│  RNIC 直接读 MR，对端 CPU 不参与
+    │◄─────────────────────── READ response │
+    │  poll CQ                              │
+```
+
 ## 源码导读（路径 + 函数 + 作用）
 
 以 `ib_write_bw` 为主线（`third_party/perftest/src/write_bw.c` 的 `main`）：
@@ -87,6 +128,20 @@ client: ib_write_bw -d mlx5_0 -x 3 -q 4 -s 1048576 -D 10 --report_gbits --use_cu
 8. `ctx_set_send_wqes`：预先构造好 WR 数组。按 `post_list` 串链表；`(j + 1) % cq_mod == 0` 时才置 `IBV_SEND_SIGNALED`；小于 inline 上限时置 `IBV_SEND_INLINE`；按 verb 填 `opcode_verbs_array[...]` 和 `wr.rdma.rkey / remote_addr`。
 9. `run_iter_bw`：主循环。发送窗口条件是 `scnt + post_list <= tx_depth + ccnt`（在途数不超过 tx_depth），用 `get_cycles()` 记录 `tposted`，调 `post_send_method`，然后 `ibv_poll_cq` 回收；`run_iter_bw_server` 是被动端；`run_iter_bi` 是双向；`run_iter_bw_infinitely` 对应 `--run_infinitely`。
 10. `print_report_bw`（`perftest_parameters.c`）：按上面的公式输出。
+
+第 9 步的发送窗口画出来是这样（单个 QP；`ccnt` 在每拿到一个 CQE 时加 `cq_mod`，因为一个 signaled WR 代表 `cq_mod` 个 WR 完成）：
+
+```text
+  WR index   0 ─────────────────────────────────────────────────────────────►
+             ├────── completed ───────┼──── in flight (posted) ────┼── next ──►
+             0                       ccnt                         scnt
+                                      │◄─────── scnt - ccnt ──────►│
+
+  post 条件：scnt + post_list <= tx_depth + ccnt      → 在途 WR 不超过 tx_depth
+  post 后：  scnt += post_list                         （一次 doorbell 一串 WR）
+  poll 后：  每个 CQE 让 ccnt += cq_mod                 （selective signaling）
+  所以：     在途字节上限 ≈ tx_depth × size；带宽 ≈ 在途字节 / RTT，深度不够就打不满
+```
 
 延迟主线：`write_lat.c` → `run_iter_lat_write`（尾字节轮询）/ `run_iter_lat_write_imm`；`send_lat.c` → `run_iter_lat_send`；`read_lat.c` → `run_iter_lat`；`print_report_lat` 计算 median、百分位数和 `rtt_factor`。
 

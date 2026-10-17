@@ -6,6 +6,25 @@
 
 把 NCCL 拆成"建通信组 → 识别拓扑 → 搜索通道 → 建连接 → 入队发射 kernel → GPU primitives 搬数据 / proxy 线程驱动网卡"这几段，每段对应一篇源码导读。
 
+下图是这几段与本章笔记编号的对应：左列是 init 时做一次的事，右列是每次集合调用都走的路径；左下"建连接"产出的 P2P/SHM/NET 连接供右侧 kernel 和 proxy 使用（默认懒连接时，这一步推迟到首次使用，见 01）。
+
+```text
+                        frameworks / nccl-tests (05)
+                ┌─────────────────────┴─────────────────────┐
+                ▼                                           ▼
+    ncclCommInitRank (once)                   ncclAllReduce ... (per call)
+  ┌────────────────────────────┐           ┌────────────────────────────────────┐
+  │ 01 bootstrap ring,         │           │ 03 enqueue / group,                │
+  │    AllGather peer info     │           │    tuning, kernel plan             │
+  ├────────────────────────────┤           └───────┬─────────────────┬──────────┘
+  │ 02 topo XML, paths,        │                   ▼                 ▼
+  │    ring/tree/NVLS search   │           ┌───────────────┐  ┌─────────────────┐
+  ├────────────────────────────┤           │ 03 GPU kernel │  │ 04 proxy        │
+  │ 01 connect transports      │──────────►│    primitives │◄►│ ncclNet_t → NIC │
+  │    P2P / SHM / NET         │           └───────────────┘  └─────────────────┘
+  └────────────────────────────┘
+```
+
 ## 在调用链中的位置
 
 - 上层：PyTorch ProcessGroupNCCL、vLLM/SGLang 的通信封装调用 `ncclCommInitRank`、`ncclAllReduce`、`ncclGroupStart/End`（见 05-framework-integration，另行编写）。

@@ -77,6 +77,30 @@ def ring_allreduce(buf, r, N):
 - **ReduceScatter 的不变式**：第 c 块从 rank `c+1` 出发，每走一跳多累加一个 rank 的贡献，走 N−1 跳后正好停在 rank c，这时已累加全部 N 份。最后一步 `s = N−2` 时，r 收到的块号是 `(r−N) mod N = r`，验证了"结束时 rank r 持有第 r 块"。
 - **AllGather**：第 0 步每个 rank 发出自己持有的完整块 `chunk[r]`，之后每步把上一步收到的块继续往右传。
 
+把上面的公式代入 N = 4 逐步展开如下。每一行都是"所有 rank 同时发给右邻 (r+1)%4"；cK(abc) 表示"第 K 块，已沿路径累加 rank a、b、c 的贡献"，cK(*) 表示 4 份全齐：
+
+```text
+ReduceScatter: step s, rank r sends c[(r-s-1)%4], receives c[(r-s-2)%4] and adds
+              rank 0        rank 1        rank 2        rank 3
+s=0  send     c3            c0            c1            c2
+     got      c2(30)        c3(01)        c0(12)        c1(23)
+s=1  send     c2(30)        c3(01)        c0(12)        c1(23)
+     got      c1(230)       c2(301)       c3(012)       c0(123)
+s=2  send     c1(230)       c2(301)       c3(012)       c0(123)
+     got      c0(*)         c1(*)         c2(*)         c3(*)       <- rank r holds c_r
+
+AllGather: step s, rank r sends c[(r-s)%4], receives c[(r-s-1)%4] and overwrites
+              rank 0        rank 1        rank 2        rank 3
+s=0  send     c0(*)         c1(*)         c2(*)         c3(*)
+     got      c3(*)         c0(*)         c1(*)         c2(*)
+s=1  send     c3(*)         c0(*)         c1(*)         c2(*)
+     got      c2(*)         c3(*)         c0(*)         c1(*)
+s=2  send     c2(*)         c3(*)         c0(*)         c1(*)
+     got      c1(*)         c2(*)         c3(*)         c0(*)       <- all 4 chunks everywhere
+```
+
+读图要点：每一步的 `send` 一行等于上一步的 `got` 一行（刚收到并累加好的块马上往右传）；c0 从 rank 1 出发，经 rank 2、3，在 s=2 停在 rank 0，正是上面说的"第 c 块从 rank c+1 出发、走 N−1 跳停在 rank c"。
+
 对照实现：`labs/ccl_sim/algorithms.py` 的 `_ring_rs_phase`、`_ring_ag_phase`，测试 `test_all_algorithms_match_naive_sum`。
 
 ### 代价
@@ -202,8 +226,8 @@ __device__ void barrier(Signal* self, Signal* peers[N], int rank, Phase ph, bool
 
 vLLM 中对应 `barrier_at_start` / `barrier_at_end`（`csrc/custom_collective_common.cuh`）：
 
-- 开始屏障和最后一道屏障只需要 volatile 读写，因为它们不需要让对端看到本卡之前写的数据。
-- two-shot 的中间屏障需要 release/acquire（`st_flag_release` / `ld_flag_acquire`），因为下一阶段要读对端在屏障之前写的 tmp。
+- 开始屏障（`barrier_at_start`）和 one-shot 的最后一道屏障（`cross_device_reduce_1stage` 里的 `barrier_at_end<ngpus, true>`，即 `final_sync`）只需要 volatile 读写，因为它们不需要让对端看到本卡之前写的数据。
+- two-shot 的中间屏障需要 release/acquire（`st_flag_release` / `ld_flag_acquire`），因为下一阶段要读对端在屏障之前写的 tmp。vLLM 的 `cross_device_reduce_2stage` 只有 `barrier_at_start` 和这道中间的 `barrier_at_end<ngpus>`（`final_sync = false`），stage 2 之后没有再加屏障。
 
 ### One-shot：每个 rank 读所有对端的完整输入，自己归约
 
@@ -250,6 +274,24 @@ __global__ void twoshot_allreduce(T* peer_in[N], T* peer_tmp[N], T* out, int n, 
 - vLLM 源码里有一个细节值得在面试中提：两个阶段的线程下标 `tid` 必须对应，因为跨设备的可见性只在"屏障两侧相同 tid 的线程"之间得到保证（`cross_device_reduce_2stage` 的注释）。
 - vLLM 的选择逻辑（`csrc/custom_all_reduce.cuh`）：2 卡永远用 one-shot；全互联时，≤4 卡且 < 512 KiB 或 ≤8 卡且 < 256 KiB 用 one-shot，否则用 two-shot；不是全互联（如部分 PCIe）且超过 2 卡时，Python 侧根本不启用 custom allreduce（`custom_all_reduce.py` 中 `fully_connected` 判断）。
 
+两种 kernel 的访存区域对比如下（N = 4，从 rank 1 的视角；输入按 rank 切成 4 段 seg0..seg3，`X` 表示要读的区域）：
+
+```text
+            one-shot                  two-shot step 1 (RS)        two-shot step 2 (AG)
+            seg0 seg1 seg2 seg3       seg0 seg1 seg2 seg3
+in_0 (peer)  X    X    X    X          .    X    .    .           tmp_0 ──► out seg0
+in_1 (self)  X    X    X    X          .    X    .    .           tmp_1 ──► out seg1
+in_2 (peer)  X    X    X    X          .    X    .    .           tmp_2 ──► out seg2
+in_3 (peer)  X    X    X    X          .    X    .    .           tmp_3 ──► out seg3
+             │                              │
+             ▼                              ▼            barrier(MID, release/acquire)
+         out = Σ_p in_p             tmp_1 = Σ_p in_p[seg1]
+     remote reads: (N-1)·M          remote reads: (N-1)/N·M   +   remote reads: (N-1)/N·M
+     barriers: START, END           barriers: START, MID
+```
+
+one-shot 每个 rank 都把 N 份完整输入读一遍，字节多但只有一个阶段；two-shot 每个 rank 只归约自己负责的一段，再从其他 rank 的 tmp 拉回其余段，两个阶段之间必须隔一道带内存序的屏障。
+
 对照实现：`fullmesh_allreduce_oneshot`、`fullmesh_allreduce_twoshot`（`labs/ccl_sim/algorithms.py`），测试类 `TestFullMesh`。
 
 ---
@@ -287,7 +329,7 @@ __global__ void twoshot_allreduce(T* peer_in[N], T* peer_tmp[N], T* out, int n, 
 2. **问**：8 卡 H100 NVSwitch 上，decode 时 TP AllReduce 只有 64 KiB，你用什么算法？为什么？
    **答**：Full-mesh one-shot。消息落在 α 主导区间，Ring 需要 14 个 α，one-shot 只要 1 个；虽然字节数是 Ring 的约 4 倍，但 64 KiB 的传输时间远小于 α。配合 CUDA Graph 消除 launch 开销。
 3. **问**：one-shot kernel 为什么需要结束屏障？去掉会怎样？
-   **答**：防止对端还在读本卡输入时，本卡已经开始下一轮并覆盖输入（读后写冲突），去掉会偶发数值错误。two-shot 的中间屏障则保证 ReduceScatter 写入的 tmp 对其他卡可见，所以必须用 release/acquire；开始和最后一道屏障只用 volatile 即可。
+   **答**：防止对端还在读本卡输入时，本卡已经开始下一轮并覆盖输入（读后写冲突），去掉会偶发数值错误。two-shot 的中间屏障则保证 ReduceScatter 写入的 tmp 对其他卡可见，所以必须用 release/acquire；开始屏障和 one-shot 的结束屏障（`final_sync`）只用 volatile 即可。vLLM 的 two-shot 只有开始屏障和中间屏障两道，stage 2 之后没有结束屏障。
 4. **问**：flag 为什么只增不减？
    **答**：不需要每轮清零。如果清零，必须保证所有对端都已看到上一轮的值再清，这又需要一次同步。递增的 flag 让"等于本轮值"天然区分新旧轮次，也方便被 CUDA Graph 重放。
 5. **问**：Full-mesh All2All 和 Ring 能做 All2All 吗？哪个好？

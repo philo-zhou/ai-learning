@@ -48,6 +48,23 @@ DDP / FSDP / Megatron / vLLM 兜底 / DeepEP（复用 comm）
 - `ProcessGroupNCCL.Options` 的 `is_high_priority_stream`：让 NCCL stream 用高优先级，在有计算 kernel 排队时优先调度通信（快照 `init_process_group` 的 `pg_options` 文档）。
 - 与 vLLM pynccl 对比：pynccl 在**当前 stream** 上发起通信（`third_party/vllm/vllm/distributed/device_communicators/pynccl.py` `all_reduce(..., stream=None)` 默认 `current_stream()`），没有 event 交接，顺序简单、CUDA Graph 友好，但不能自动重叠。
 
+把上面几条串成一次 `all_reduce(t, async_op=True)` 的时序（概念图，C++ 实现待确认）：
+
+```text
+ CPU thread              compute stream (current)         NCCL stream (per device)
+ ──────────              ────────────────────────         ────────────────────────
+ y = matmul(...)    ──►  [ matmul kernel ]
+ work = all_reduce  ──►  record ev_in ──────────────────► wait(ev_in)
+   (async_op=True)                                        [ ncclAllReduce kernel ]
+   立即返回 WorkNCCL                                      record ev_done（Work 持有它）
+ other_compute()    ──►  [ other kernels ]   ◄── 与通信并行（重叠）
+ work.wait()        ──►  wait(ev_done) ◄───────────────── ev_done
+ use(t)             ──►  [ kernel reading t ]             安全：已排在 ev_done 之后
+ t.cpu() / torch.cuda.synchronize()                       ← 到这里 CPU 才真正等到结果
+```
+
+对比 pynccl：没有右边那条 stream，`ncclAllReduce` 直接排在 compute stream 上，因而没有 event 交接，也就不能和后面的计算重叠。
+
 ### 4. async_op 与 Work
 
 - `all_reduce(tensor, op, group, async_op=False)`：内部构造 `AllreduceOptions`，`opts.asyncOp = async_op`，调用 `group.allreduce([tensor], opts)` 得到 `work`；`async_op=True` 直接返回 Work，否则在需要时 `work.wait()` 后返回 None（快照 `def all_reduce` L3812 起）。
@@ -62,6 +79,23 @@ DDP / FSDP / Megatron / vLLM 兜底 / DeepEP（复用 comm）
 - 超时语义（文档原意）：超过 timeout 后 collective 被**异步 abort 且进程崩溃**，因为 CUDA 是异步执行的，失败的 NCCL 操作之后继续跑用户代码可能在损坏数据上运行；设置 `TORCH_NCCL_BLOCKING_WAIT` 时改为阻塞等待到超时再抛错。
 - watchdog（概念）：后台线程周期性检查未完成的 WorkNCCL——完成 event 是否触发、是否超时、`ncclCommGetAsyncError` 是否报错；出错时 abort communicator（`ncclCommAbort`）并按 `TORCH_NCCL_ASYNC_ERROR_HANDLING` 的策略处理（快照 `_abort_process_group` 注释：手动 abort 应在关闭该选项时使用，否则 watchdog 可能已自动处理错误/超时并 abort）。
 - 还有一个“心跳监控”线程监视 watchdog 自身是否卡住（概念；变量名与默认值待确认）。
+
+watchdog 对每个未完成 Work 的处理逻辑（概念图，函数名与具体分支待确认）：
+
+```text
+ watchdog 线程（周期性）
+   for work in 未完成的 WorkNCCL:
+     ├─ ev_done 已触发 ────────────────────────► 完成，移出列表
+     ├─ 超过 timeout（NCCL 默认 10 min）
+     │  或 ncclCommGetAsyncError 报错 ─────────► ncclCommAbort
+     │                                            ├─► 按 TORCH_NCCL_ASYNC_ERROR_HANDLING 处理（终止进程等）
+     │                                            └─► 超时 dump Flight Recorder（缓冲大小 > 0 时）
+     └─ 其他 ──────────────────────────────────► 下一轮再查
+
+ 心跳监控线程 ──► 监视 watchdog 自己是否卡住
+ TORCH_NCCL_BLOCKING_WAIT=1 ──► work.wait() 改为 CPU 阻塞等待，超时抛异常
+```
+
 - Flight Recorder：记录最近 N 次集合通信的元数据（序号、op、大小、状态、调用栈），超时时 dump，用来定位“哪个 rank 少调/多调了一次 collective”。快照里缓冲大小读 `TORCH_FR_BUFFER_SIZE`，回退到 `TORCH_NCCL_TRACE_BUFFER_SIZE`，默认 `"0"`（关闭）。
 - NaN 检查：快照注释“ProcessGroupNCCL consumes TORCH_NCCL_NAN_CHECK itself”；后端无关版本为 `TORCH_DIST_NAN_CHECK`。
 - 与 CUDA Graph 冲突：vLLM 的 skill 文档提到 ROCm 上在 HIP graph 中捕获 ProcessGroupNCCL collective 会触发 watchdog（不能查询正在捕获的 stream 上记录的 event），benchmark 时可用 `TORCH_NCCL_BLOCKING_WAIT=1` 关闭 watchdog（`third_party/vllm/.agents/skills/kernel-microbenchmark/SKILL.md`）。这也是推理框架偏爱 pynccl/custom AR 的原因之一。

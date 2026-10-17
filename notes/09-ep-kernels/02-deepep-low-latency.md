@@ -108,6 +108,25 @@ named barrier 同步 warp group
 各 sub-warp 并行：把 n 条消息的头（src_token_idx）、数据、scale 拷到 recv_x[local_expert][begin + i]
 ```
 
+下图对照一个本地专家 e 的两块内存：左边是 RDMA 落点（对称堆里的 `rdma_recv_x`，按源 rank 分区、每区固定 `num_max` 个槽位），右边是整理后返回给框架的 `packed_recv_x`（各段按到达顺序紧凑拼接）。偏移公式与 `internode_ll.cu` 中发送端算 `dst_ptr`、接收端算 `rdma_recv_x_uint8` 的写法一致：
+
+```text
+rdma_recv_x, local expert e                       packed_recv_x[e]
+msg idx = (e*num_ranks + src)*num_max + slot      (num_ranks*num_max rows)
+┌──────────────────────────────┐                  ┌──────────────────────────┐
+│ src 0 │ n0 used │  empty     │ ─┐               │ src 2 segment (n2 rows)  │ ← begin = 0
+├──────────────────────────────┤  │               ├──────────────────────────┤
+│ src 1 │ n1 used │  empty     │ ─┼── copy ─────► │ src 0 segment (n0 rows)  │ ← begin = n2
+├──────────────────────────────┤  │               ├──────────────────────────┤
+│ src 2 │ n2 used │  empty     │ ─┘               │ src 1 segment (n1 rows)  │ ← begin = n2+n0
+├──────────────────────────────┤                  ├──────────────────────────┤
+│ ...                          │                  │ unused tail              │ ← recv_count[e] 之后无效
+└──────────────────────────────┘                  └──────────────────────────┘
+rdma_recv_count[e*num_ranks + src] = -(n+1)       layout_range[e][src] = pack(n, begin)
+```
+
+图中段的先后只是一种可能的到达顺序；哪个源 rank 的计数先被看到，哪个就先抢到 `begin`。
+
 - 输出里各源 rank 的段是**按到达顺序紧凑拼接**的（`atomicAdd` 抢起点），所以 `recv_count` 之前的行全部有效。
 - FP8 的 scale 按"列主序"写出，方便下游 GEMM 用 TMA 加载；`use_ue8m0` 时把 4 个 UE8M0 打包成一个 int。
 - 可选统计：`cumulative_local_expert_recv_stats` 累计每个专家收到的 token 数（给 EPLB 用），`dispatch_wait_recv_cost_stats` 累计等待每个源 rank 的时钟周期（定位慢 rank，README 提到的 DeepXTrace 就基于它）。

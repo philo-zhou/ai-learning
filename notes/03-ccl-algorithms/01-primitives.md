@@ -29,6 +29,39 @@
 | Gather / Scatter(root) | 分片在各 rank / 整体在 root | 拼接到 root / 分片到各 rank | — |
 | Send / Recv | 点对点 | 必须成对出现；多对需要放进同一个 `ncclGroupStart/End` 一起推进 | — |
 
+下图用 n = 4 把上表前六行画成"执行前 → 执行后"：rank 0..3 的输入分别记作 a、b、c、d，切成 4 段时记作 a0..a3；Sk = ak⊕bk⊕ck⊕dk，S = a⊕b⊕c⊕d。
+
+```text
+               before                          after
+Broadcast      r0: x                           r0: x    r1: x    r2: x    r3: x
+(root=r0)      r1: -   r2: -   r3: -
+
+Reduce         r0: a   r1: b   r2: c   r3: d   r0: S    (r1..r3 unchanged)
+(root=r0)
+
+AllReduce      r0: a0 a1 a2 a3                 r0: S0 S1 S2 S3
+               r1: b0 b1 b2 b3                 r1: S0 S1 S2 S3
+               r2: c0 c1 c2 c3                 r2: S0 S1 S2 S3
+               r3: d0 d1 d2 d3                 r3: S0 S1 S2 S3
+
+ReduceScatter  r0: a0 a1 a2 a3                 r0: S0
+               r1: b0 b1 b2 b3                 r1: S1
+               r2: c0 c1 c2 c3                 r2: S2
+               r3: d0 d1 d2 d3                 r3: S3
+
+AllGather      r0: a                           r0: a b c d
+               r1: b                           r1: a b c d
+               r2: c                           r2: a b c d
+               r3: d                           r3: a b c d
+
+AllToAll       r0: a0 a1 a2 a3                 r0: a0 b0 c0 d0
+               r1: b0 b1 b2 b3                 r1: a1 b1 c1 d1
+               r2: c0 c1 c2 c3                 r2: a2 b2 c2 d2
+               r3: d0 d1 d2 d3                 r3: a3 b3 c3 d3
+```
+
+AllToAll 一行：左边 4×4 矩阵的第 j 列变成右边的第 j 行，这就是"转置"；Broadcast、AllGather、AllToAll 都只搬运数据、不做 ⊕。
+
 易混点：
 
 - AllGather 只拼接、不求和；AllToAll 只重新分配、不归约。MoE 的 combine 是"AllToAll 回传 + 恢复 token 顺序 + 按路由权重加权求和"，不是 AllReduce（ai-infra-book 6.4.1 节表格后的说明）。
@@ -38,6 +71,22 @@
 ### 组合关系
 
 1. **AllReduce = ReduceScatter + AllGather**：先归约并让每个 rank 留一段（RS），再把这些段收集到所有 rank（AG）。两步各发 (n-1)/n·M，合计 2(n-1)/n·M——这正是 AllReduce busbw 系数 2(n-1)/n 的来源，也是 Ring 与 Halving-Doubling 的骨架。`labs/ccl_sim` 中 `ring_allreduce` 就是 `_ring_rs_phase` 接 `_ring_ag_phase`，测试 `test_allreduce_equals_reduce_scatter_plus_allgather` 验证了 `ring_allgather(ring_reduce_scatter(x)) == ring_allreduce(x)`。
+
+   沿用上图的记号（n = 4），两种分解的中间状态如下；每个箭头旁是该阶段每个 rank 发送的数据量（带宽最优实现下）：
+
+   ```text
+   AllReduce = ReduceScatter + AllGather
+     r0: a0 a1 a2 a3              r0: S0                  r0: S0 S1 S2 S3
+     r1: b0 b1 b2 b3   ── RS ──►  r1: S1    ── AG ──►     r1: S0 S1 S2 S3
+     r2: c0 c1 c2 c3  (n-1)/n·M   r2: S2   (n-1)/n·M      r2: S0 S1 S2 S3
+     r3: d0 d1 d2 d3              r3: S3                  r3: S0 S1 S2 S3
+                                     ▲
+                                     └─ ZeRO/FSDP、SP 就在这里把两半拆到不同的算子边界
+
+   AllReduce = Reduce + Broadcast
+     r0..r3: a b c d   ── Reduce ──►  r0: S   ── Broadcast ──►  r0..r3: S
+   ```
+
 2. **AllReduce = Reduce + Broadcast**：先归约到 root，再广播。这是树形算法（Binary Tree、Double Binary Tree）的骨架。
 3. **AllGather 是 ReduceScatter 的"对偶"**：把 RS 的通信过程时间反转、把"累加"换成"拷贝"，就是 AG。所以两者的代价公式只差 γ 项。
 4. **Broadcast = Scatter + AllGather**（大消息广播的经典做法，带宽项从 log n·M 降到约 2M）。
@@ -55,6 +104,16 @@
 | EP（MoE） | 专家集合 | dispatch：AllToAll(v)；combine：AllToAll(v) 回传 + 加权求和 | 每对 rank 之间的数据量随路由变化（不等长、不均衡）；推理 decode 小消息、延迟敏感，详见 [04-all2all.md](04-all2all.md) |
 | PP | 按层分阶段 | 相邻 stage 之间 Send/Recv 激活（前向）和激活梯度（反向） | 点对点、消息中等；关注气泡而非带宽 |
 | 其他 | — | Broadcast：初始权重/RNG 种子同步；AllGather：收集 logits、KV 元数据；Reduce：少见 | — |
+
+上表 TP 与 SP 两行的区别，画成一个块（Attention 或 MLP）的前向数据流：通信总量相同，SP 只是把 AllReduce 拆成两半，让中间的逐 token 算子只处理 1/t 的序列。
+
+```text
+TP:       LayerNorm ─► ColParallel Linear ─► RowParallel Linear ─► AllReduce ─────► Dropout ─► ...
+          (full seq)                         (partial sums)                        (full seq)
+
+TP + SP:  LayerNorm ─► AllGather ─► ColParallel Linear ─► RowParallel Linear ─► ReduceScatter ─► Dropout ─► ...
+          (seq 1/t)                                       (partial sums)                        (seq 1/t)
+```
 
 ## 源码导读
 

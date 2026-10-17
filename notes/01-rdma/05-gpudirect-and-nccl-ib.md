@@ -28,6 +28,26 @@ libibverbs / mlx5dv → RNIC ──PCIe P2P──> GPU 显存
 
 ### GPUDirect RDMA 的两条内核路径
 
+先看 GDR 省掉的是哪一段：没有 GDR 时，`net.cc` 把 net buffer 放在主机内存，跨机数据要在主机内存中转；有 GDR 时网卡经 PCIe P2P 直接读写显存（NCCL 默认要求 GPU 与 NIC 之间只隔 PCIe switch，即距离不超过 `PATH_PXB`，见下一节）。
+
+```text
+无 GDR（buffer 在主机内存）：
+
+  ┌──────────┐  PCIe   ┌──────────┐         ┌──────────┐  PCIe   ┌──────┐
+  │ GPU mem  │════════►│ CPU / RC │════════►│ host mem │════════►│ NIC  │════► network
+  └──────────┘         └──────────┘         └──────────┘  DMA    └──────┘
+                                     多一次经过主机内存，并占用这部分内存带宽
+
+有 GDR（buffer 在显存，NCCL 日志带 /GDRDMA）：
+
+  ┌──────────┐  PCIe P2P   ┌─────────────┐   PCIe P2P   ┌──────┐
+  │ GPU mem  │◄═══════════►│ PCIe switch │◄════════════►│ NIC  │════► network
+  └──────────┘             └─────────────┘              └──────┘
+                           不经过 CPU root complex 和主机内存
+```
+
+两条内核路径解决的是同一个问题：怎样让 `ibv_reg_*` 能把一段显存注册成 MR。
+
 | 路径 | 机制 | NCCL 如何探测 |
 |---|---|---|
 | **peermem**（`nvidia-peermem`，旧名 `nv_peer_mem`） | 内核模块把 GPU 显存注册进 RDMA 子系统的 "peer memory" 接口，之后普通 `ibv_reg_mr(gpu_ptr)` 就能 pin 住显存 | `gdr.cc`：`ibGdrSupportInitOnce` 检查 `/sys/kernel/mm/memory_peers/nv_mem/version`、`.../nv_mem_nc/version`、`/sys/module/nvidia_peermem/version` 之一是否存在 → `ncclIbGdrSupport` |
@@ -40,10 +60,35 @@ libibverbs / mlx5dv → RNIC ──PCIe P2P──> GPU 显存
 ### NCCL 何时启用 GDR（`src/graph/paths.cc`：`ncclTopoCheckGdr`）
 
 1. NIC 和 GPU 都必须标记 `gdrSupport`。
-2. 对 read 方向（发送端由网卡从显存读）：`NCCL_NET_GDR_READ`（默认 -2，即自动）。自动模式下，Ampere 之前（`cudaCompCap < 80`）且没有 NVLink 对端时关闭 GDR read。
-3. 距离判定：默认阈值 `PATH_PXB`（GPU 与 NIC 之间只经过 PCIe switch、不经过 CPU）；`NCCL_NET_GDR_C2C`（默认 1）在 C2C 系统上可以放宽到 `PATH_P2C`；用户可以用 `NCCL_NET_GDR_LEVEL` 覆盖。PXN 场景下改用中转 GPU 的距离。
+2. 对 read 方向（发送端由网卡从显存读）：`NCCL_NET_GDR_READ`（默认 -2，即自动）。自动模式下，Ampere 之前（`cudaCompCap < 80`）且没有 NVLink 对端时关闭 GDR read；单 GPU 系统被当作"有 NVLink"（源码注释：不知道是否有其他通信器，单 GPU 时倾向保持本地），所以单卡机器上 GDR read 仍开启。
+3. 距离判定：默认阈值 `PATH_PXB`（GPU 与 NIC 之间只经过 PCIe switch、不经过 CPU）；`NCCL_NET_GDR_C2C`（默认 1）开启时，若 GPU 的 `mloPart` 未定义，或全通信器支持 cuMem GDR 且驱动版本 `>= 13040`（CUDA 13.4+），阈值放宽到 `PATH_P2C`；用户可以用 `NCCL_NET_GDR_LEVEL` 覆盖。PXN 场景下改用中转 GPU 的距离。
 4. C2C 系统上，路径如果经过 PCI，就设为 `ncclTopoGdrModePci`（dmabuf 映射类型改为 PCIe，见 `net.cc`：`getHandleForAddressRangeFlags`）。
 5. 是否需要 flush：`ncclTopoNeedFlush` 中，Hopper 及以后（`cudaCompCap >= 90`）默认不 flush，除非是 C2C 控制路径 + PCIe 数据路径（Data Direct）；Ampere 及以前总是 flush；`NCCL_NET_FORCE_FLUSH` 可以强制 flush。
+
+第 1～4 步按 `ncclTopoCheckGdr` 的代码顺序画成决策树（任何一步返回"关"，`gdrMode` 就保持 `ncclTopoGdrModeDisable`）：
+
+```text
+ncclTopoCheckGdr(system, rank, netId, read, &gdrMode)
+ │
+ ├─ net.gdrSupport == 0 或 gpu.gdrSupport == 0 ?            是 → 关
+ │
+ ├─ read == 1（发送方向，网卡从显存读）?
+ │    ├─ NCCL_NET_GDR_READ == 0 ?                          是 → 关
+ │    └─ 自动（< 0）且 cudaCompCap < 80 且无 NVLink 对端 ?  是 → 关
+ │         （单 GPU 系统视为有 NVLink，不关）
+ │
+ ├─ 阈值 netGdrLevel = PATH_PXB
+ │    ├─ NCCL_NET_GDR_C2C 开启（默认 1）且（mloPart 未定义
+ │    │   或 cuMemGdrSupport && minDriverVersion >= 13040）→ 放宽到 PATH_P2C
+ │    └─ 设置了 NCCL_NET_GDR_LEVEL → 以它为准
+ │
+ ├─ distance = GPU 到 NIC 的路径类型
+ │    └─ distance == PATH_PXN → 换成中转 GPU 到 NIC 的距离
+ │
+ ├─ distance > netGdrLevel ?                               是 → 关
+ │
+ └─ 开；C2C 系统上路径经过 PCI → ncclTopoGdrModePci
+```
 
 **为什么要 flush**：网卡对显存的 PCIe 写可能还没对 GPU kernel 可见（posted write），NCCL 接收端在把数据交给 kernel 之前，发一个 1 字节的 RDMA READ 读这块 GPU buffer（`p2p.cc`：`ncclIbIflush`，读回到主机上的 `gpuFlushHostMem`）。READ 的完成保证前面的写都已落地。flush 用的是一个自环 QP（`connect.cc`：`ncclIbCreateFlushQp`，注释写明 "loopback QP (connected to itself)"）。只有 GDR/dmabuf 可用且 `NCCL_GDR_FLUSH_DISABLE=0` 时才启用（`ncclIbAcceptImpl` 中的 `rComm->flushEnabled`）。
 
@@ -79,6 +124,31 @@ libibverbs / mlx5dv → RNIC ──PCIe P2P──> GPU 显存
    - 最后串一个 `IBV_WR_RDMA_WRITE_WITH_IMM` 并 signal，`imm_data` 在 BY_ID 匹配模式下是 request id，否则是 size。多接收（nreqs>1）或 AR 大消息（双方不都支持 OOO RQ 时）情况下，它会作为一个独立的 WR 追加在数据 WRITE 之后。其中 nreqs>1 时，这个 WR 携带 `nreqs × sizeof(int)` 的各请求 size，写进对端的 completion records；AR 单请求时它不带数据（`num_sge` 保持 0），只负责送 IMM；
    - **多 QP 切分**：一条请求铺到 `nqps` 个 QP 上（`NCCL_IB_SPLIT_DATA_ON_QPS=1` 时用全部 QP，否则每块设备一个，见 `common.h`：`ncclIbCommBaseGetNqpsPerRequest`）。QP 按 `(id * nQps + qpIndex) % nqps` 轮转（`ncclIbCommBaseGetQpForRequest`）。每个 QP 分到的字节数 = size × 设备权重 / 100 / 该设备 QP 数，按 `IB_WRITE_CHUNK_ALIGNMENT`（128 B，`p2p.cc`）对齐；权重来自设备速率（`ncclIbComputeLbWeights`）。
 3. 接收端用 `ncclIbTest` 中的 `wrap_ibv_poll_cq` 拿到 `IBV_WC_RECV_RDMA_WITH_IMM`，所有 QP 的事件都到齐后请求完成。如果 buffer 在 GPU 上，再走 `ncclIbIflush`。
+
+把上面三步按时间排开（以最常见的 nreqs = 1、不触发 AR 拆分为例：这时唯一的数据 WR 本身就被改成 WRITE_WITH_IMM 并 signal；nreqs > 1 或 AR 大消息时，才在数据 WRITE 之后另追加一个 WRITE_WITH_IMM）：
+
+```text
+  receiver                                              sender
+  ────────                                              ──────
+  (accept 时每个 QP 已预投 RECV，留给 IMM 消耗)
+  ncclIbIrecv: fill ncclIbSendFifo {addr, rkeys[], size, idx, nreqs}
+  ncclIbPostFifo ═══ RDMA WRITE (CTS) ════════════════► ctsFifo[slot]
+                                                        ncclIbIsend:
+                                                          ctsFifo[slot].idx == fifoHead + 1 ?
+                                                            否 → 直接返回，下次再查
+                                                            是 → ncclIbMultiSend
+                                                        对选中的每个 QP（共 nqps 个）:
+                                                          length = size × weight / 100 / 该设备 QP 数
+                                                                   （按 128 B 对齐）
+  recv buffer ◄════ RDMA_WRITE_WITH_IMM (signaled) ════   imm = size 或 request id
+  ...（每个 QP 各一条）
+  ncclIbTest: poll CQ → IBV_WC_RECV_RDMA_WITH_IMM
+    所有 QP 的事件都到齐 → 数据已落地（对 GPU 是否可见另说）
+  if GPU buffer 且 flushEnabled:
+    ncclIbIflush: flush QP（自环）RDMA READ 1 B
+    READ 完成 → 之前网卡写入显存的数据已对 GPU 可见
+  请求完成，proxy 才把 buffer 交给 GPU kernel
+```
 
 这就是"接收端驱动的 rendezvous"：接收端先告诉发送端写到哪里，发送端做纯单边 WRITE，不需要中间拷贝；CTS 机制本身也天然起到流控作用，接收端没准备好时发送端不会发。
 

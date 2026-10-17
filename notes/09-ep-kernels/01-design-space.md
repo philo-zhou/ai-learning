@@ -30,11 +30,42 @@ GPU 直驱网卡（NVSHMEM IBGDA / DOCA GPUNetIO / NCCL GIN）+ NVLink load/stor
 | **先交换计数再分配**：先跑一个 notify/layout 阶段交换每对 rank 的数量，接收端算前缀和后分配 | 双方协商 | DeepEP V1 normal（`get_dispatch_layout` + notify） | 多一轮通信；要把计数同步给 CPU 才能分配输出张量，和 CUDA Graph 冲突 |
 | **全局路由先 AllGather，各自算出确定下标** | 所有人用同一份全局视图算出同一结果 | Hybrid-EP：`Executor::allgather_routing_map` + `scan` kernel 生成 `sparse_to_dense_map`（`third_party/DeepEP-hybrid-ep/csrc/hybrid_ep/executor/executor.cu`、`backend/hybrid_ep_backend.cuh`） | 多一次 AllGather（路由表很小：token 数 × 专家数个 bool 或 top-k 下标）；换来的是 kernel 里不需要任何排队与原子分配 |
 
+下图把三种做法按"数据真正发出之前要经过哪些步骤"排成流水，看清多出来的那一轮在哪里：
+
+```text
+A. sender-side atomic slot (DeepEP LL)
+   sender : atomicAdd(counter[e]) ──► slot ──► WRITE recv[e_local][my_rank][slot]
+   recv[e_local] : | src 0: num_max slots | src 1: num_max slots | ... |   ← 每个源 rank 一段固定分区，尾部有空洞
+
+B. exchange counts first (V1 normal)
+   notify kernel: swap per-pair counts ──► prefix sum ──► host polls moe_recv_counter
+                  ──► allocate recv_x ──► dispatch kernel sends data    ← 多一轮通信 + CPU 等待
+
+C. allgather routing (Hybrid-EP)
+   allgather_routing_map ──► scan on every rank ──► same sparse_to_dense_map everywhere
+                  ──► dispatch kernel writes to fixed index              ← 多一次小 AllGather，kernel 内无原子分配
+```
+
 这个决定直接对应前面讨论过的 SEND/RECV 与 WRITE 的区别：EP 库**全部用 RDMA WRITE（内存语义）**，所以必须由某一方提前知道远端地址。上面三种做法就是三种"提前知道"的方式。
 
 ### 决定 2：完成怎么通知（信号）
 
 单边 WRITE 不会在接收端产生 CQE，接收端要靠**轮询内存里的某个标志**判断数据到齐。几种实现都用同一个技巧：**数据和标志走同一个 RC QP，标志排在数据后面**，利用 RC 按序执行，让"标志可见"蕴含"数据可见"。
+
+下图是这个技巧在一条 RC QP 上的样子：左边是发送端按顺序提交的请求，接收端按 PSN 顺序执行，只轮询最后那个标志：
+
+```text
+sender GPU (one RC QP)          wire / responder (PSN order)        receiver memory
+ WRITE token 0 ─────────────────► PSN p     ─────────────────────► slot 0
+ WRITE token 1 ─────────────────► PSN p+1   ─────────────────────► slot 1
+   ...                              ...                              ...
+ WRITE token n-1 ───────────────► PSN p+n-1 ─────────────────────► slot n-1
+ ATOMIC flag ───────────────────► PSN p+n   ─────────────────────► flag (count / += 1)
+                                                                      ▲
+                                        receiver spins on flag ───────┘
+```
+
+标志在最后一个 PSN 上，它被执行时前面的 WRITE 已经执行完；如果标志走另一条 QP，两条 QP 之间没有顺序，这个推理就不成立（见下文"性能要点与常见坑"）。乱序放置网卡上的可见性仍是待确认项（见 [README](README.md) 待深入）。
 
 | 实现 | 数据 | 标志 | 粒度 |
 |---|---|---|---|

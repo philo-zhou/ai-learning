@@ -16,6 +16,18 @@
 阶段    S1(1-2)      S2(3)      S3(4)    S4(5-6)     S5(7) S6(8)   S7(9) S8(10)
 ```
 
+把同样的 8 个阶段按层次摆开，可以看到"先代价模型、再自下而上、最后收尾"的走向：
+
+```text
+跨层/实践       S8 interview ◄── S7 perf ◄── S6 fusion
+                                                ▲
+上层                                         S5 framework
+                                                ▲
+中层      S1 algo + cost model               S4 NCCL internals
+             │                                  ▲
+下层         └───► S2 RDMA ───► S3 scale-up ────┘
+```
+
 - 书章节路径均以 `third_party/ai-infra-book/manuscripts/` 为前缀；详细章节说明见 [01-ai-infra-book-map.md](01-ai-infra-book-map.md)。
 - 每阶段末尾到 [02-jd-breakdown.md](02-jd-breakdown.md) 更新自评，并在 `docs/PROGRESS.md` 记录证据。
 - 没有 GPU / RDMA 机器时，S2、S3、S7 的实践部分降级为"读源码 + 手算"，并在验收中注明 not-run。
@@ -61,6 +73,26 @@
 - **产出物**：[04-nccl-internals](../04-nccl-internals/README.md) 下初始化、拓扑与图搜索、channel 与协议、tuning、transport 与 proxy 五篇源码导读，每篇含"路径 + 函数 + 作用"表。
 - **验收方式**：不看资料画出 NCCL 一次 AllReduce 的完整调用链；[多GPU] 用 `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,GRAPH` 跑 nccl-tests，逐行解释日志中的 ring/tree/channel 信息；扫 `NCCL_PROTO=LL,LL128,Simple` 并解释曲线交叉点。
 
+验收要求"画出完整调用链"，可以先按下面的骨架读上面列出的文件（左边是函数或文件，均以 `third_party/nccl/src/` 为前缀；右边是作用）：
+
+```text
+初始化：每个 communicator 一次（第 5 周）
+ncclCommInitRank (init.cc)
+  ├─► bootstrap.cc                               带外建立 rank 之间的联系
+  ├─► ncclTopoGetSystem (graph/topo.cc)          探测机内拓扑
+  ├─► ncclTopoComputePaths (graph/paths.cc)      算路径、判定 P2P 可达
+  ├─► ncclTopoCompute (graph/search.cc)          搜索 ring / tree 图
+  │     └─► graph/rings.cc, graph/trees.cc
+  └─► graph/connect.cc, channel.cc               建 channel 与 peer 连接
+
+每次集合调用（第 6 周）
+ncclAllReduce (collectives.cc)
+  └─► group.cc ─► enqueue/ ─► tuning/            选算法 × 协议
+        └─► device kernel: device/all_reduce.h (runRing ...)
+              primitives.h + prims_ll.h / prims_ll128.h / prims_simple.h
+                └─► transport/net.cc, transport/net_ib/ ◄──► proxy.cc (ncclProxyProgress)
+```
+
 ## S5（第 7 周）框架集成
 
 - **目标**：能讲清 DDP/FSDP/TP/EP/PD 分离各自调用了哪些集合操作、在哪个层次调用；理解推理框架为什么自带 custom allreduce。
@@ -93,6 +125,16 @@
   - 书 `07-数据中心网络.md` §7.6.1~7.6.5、`10-训练系统.md` §10.4.5；案例 `collective-paths-and-diagnosis.md`。
 - **产出物**：[07-perf-troubleshooting](../07-perf-troubleshooting/README.md) 下 nccl-tests 使用、环境变量速查、排查 checklist、典型故障案例四篇笔记。
 - **验收方式**：环境变量速查表中每一项都附 `third_party/nccl/src/` 读取位置；[多GPU/RDMA] 人为制造一次问题（如错误的 `NCCL_SOCKET_IFNAME` 或 `NCCL_IB_HCA`）并用日志定位，记录过程。
+
+分层排查的顺序是自下而上：下一层确认正常，才往上一层找原因（工具出处见上方阅读材料与题库第 47 题）：
+
+```text
+3. framework profile                     ← 看现象：步时间、通信占比、各 rank 发起时刻
+        ▲ 库层正常再往上
+2. nccl-tests (all_reduce_perf)          ← 先单机、再两机；配合 NCCL_DEBUG=INFO 看日志
+        ▲ 网卡层正常再往上
+1. perftest (ib_write_bw, --use_cuda)    ← 每张网卡点对点线速、GPU 内存路径
+```
 
 ## S8（第 10 周）面试准备
 

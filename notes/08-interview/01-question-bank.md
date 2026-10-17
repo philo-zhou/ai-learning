@@ -26,6 +26,17 @@
 - INIT：端口号、pkey、访问权限；RTR：对端 QPN、对端地址（LID 或 GID/RoCE 下的 GRH）、path MTU、RQ PSN、max_dest_rd_atomic、min_rnr_timer；RTS：SQ PSN、timeout、retry_cnt、rnr_retry、max_rd_atomic。
 - 常见坑：RoCE 下 GID index 选错（v1/v2、IPv4/IPv6）导致建链失败或不通；timeout 太小在拥塞时误重传。NCCL 对应参数 `NCCL_IB_GID_INDEX`、`NCCL_IB_TIMEOUT`（`third_party/nccl/src/transport/net_ib/connect.cc`，默认分别为 -1 和 20）。
 
+状态迁移与每一步要设的属性：
+
+```text
+RESET ──► INIT ──────────────► RTR ──────────────────────────────► RTS
+          port, pkey,          remote QPN,                         SQ PSN, timeout,
+          access flags         remote addr (LID or GID/GRH),       retry_cnt, rnr_retry,
+                               path MTU, RQ PSN,                   max_rd_atomic
+                               max_dest_rd_atomic,
+                               min_rnr_timer
+```
+
 **4. ★ 单边（Write/Read）与双边（Send/Recv）有什么区别？各适合什么？**
 - 单边：目标端 CPU 不参与，需事先知道远端地址与 rkey；Write 延迟低，Read 需要往返且占用 outstanding read 资源。双边：接收端要预先 post recv，适合控制消息、不知道目标地址的场景，可能遇到 RNR。
 - NCCL 的 IB transport 数据面以 RDMA Write 为主，配合通知机制告诉对端数据到达。待确认：具体使用 Write-with-Imm 还是独立 flag 写；确认方式：阅读 `third_party/nccl/src/transport/net_ib/p2p.cc`。
@@ -42,6 +53,20 @@
 - PFC：一跳反馈，交换机入口队列超阈值向上游发 PAUSE，按优先级暂停，防止缓冲溢出丢包；DCQCN：端到端，交换机打 ECN 标记 → 接收端回 CNP → 发送端降速，从源头降低速率。
 - 书中的量化：PFC 一跳反馈约 0.33 μs，端到端反馈约 20 μs（书中取值），PFC 先在短时间内兜住缓冲，DCQCN 再把速率降下来解除暂停（书 `07-数据中心网络.md` §7.5.2）。
 - PFC 副作用：队头阻塞、拥塞扩散、PFC 风暴、死锁（§7.5.4）。
+
+两种反馈的路径对比（时延为书中取值）：
+
+```text
+PFC: hop-by-hop, ~0.33 us
+  upstream ──data──► switch (ingress queue > threshold)
+     ▲                         │
+     └───────── PAUSE ─────────┘        按优先级暂停上游，兜住缓冲
+
+DCQCN: end-to-end, ~20 us
+  sender ──data──► switch (marks ECN) ──data+ECN──► receiver
+     ▲                                                 │
+     └──────────────────────── CNP ────────────────────┘    发送端降速
+```
 
 **8. ★★ 什么是 ECMP 哈希冲突？对集合通信有什么影响？怎么缓解？**
 - 集合通信流少而大（大象流），五元组哈希可能把多条流压到同一上行链路，造成局部拥塞，整体带宽远低于对分带宽。
@@ -70,6 +95,20 @@
 - RS 阶段 n−1 步、AG 阶段 n−1 步，每步每卡发 M/n，总发送 $2(n-1)M/n$。
 - $T_{ring}=2(n-1)\alpha+2(n-1)M/(nB)$（书式 6-9）。大 M 时趋近 $2M/B$，与 n 基本无关，带宽最优；α 项随 n 线性增长，小消息和大规模时吃亏。
 
+以 n=4、数据切成 c0~c3 为例，每格是该 rank 在这一步发给下一个 rank 的块（环：R0→R1→R2→R3→R0）：
+
+```text
+            R0    R1    R2    R3
+RS step 1   c0    c1    c2    c3      收到的块与本地同号块累加
+RS step 2   c3    c0    c1    c2      发上一步刚累加好的块
+RS step 3   c2    c3    c0    c1
+            → RS 结束：R_r 持有完整归约的 c_(r+1)，例如 R3 持有 c0
+AG step 1   c1    c2    c3    c0      先发自己完整的块
+AG step 2   c0    c1    c2    c3      再转发收到的完整块（只覆盖，不累加）
+AG step 3   c3    c0    c1    c2
+            → 共 2(n-1) = 6 步，每步每卡发 M/n
+```
+
 **14. ★ Tree 算法的时间？环和树如何选择？**
 - 未分段二项树：$T_{tree}=2\log_2 n(\alpha+M/B)$（书式 6-10）。轮数少，但每轮在关键路径上传完整张量。
 - 书中八卡 H100（α=0.822 μs、B=450 GB/s，书中取值）交点约 680 KiB：小于它用树，大于它用环（书 §6.4.2）。
@@ -82,12 +121,29 @@
 **16. ★★ 讲一下 Recursive Halving-Doubling（Rabenseifner）AllReduce。**
 - RS 用 recursive halving：第 k 步与距离 $n/2^k$ 的伙伴交换一半数据并归约，$\log_2 n$ 步后每卡持有 1/n 结果；AG 用 recursive doubling 反向。
 - 时间：$2\log_2 n \cdot \alpha + 2(n-1)M/(nB)$，带宽项与 ring 相同、延迟项为对数，中等消息有优势；要求 n 为 2 的幂（否则需要预处理），伙伴距离大时在物理拓扑上可能多跳、拥塞（书 §6.5.1 用"递归算法每轮对端距离翻倍"与 Swing 对比链路负载）。
-- 待确认：本地 NCCL 是否实现 halving-doubling；NCCL 内置算法名为 Tree、Ring、CollNetDirect、CollNetChain、NVLS、NVLSTree、PAT（`third_party/nccl/src/init.cc` 中 `ncclAlgoStr`）；确认方式：阅读 `src/tuning/pat.cc` 与 `src/device/` 中 PAT 相关实现。
+- NCCL 里有没有？本地源码核实：算法编号只有 Tree/Ring/CollNetDirect/CollNetChain/NVLS/NVLSTree/PAT 七种（`third_party/nccl/src/include/plugin/nccl_tuner.h` 的 `NCCL_ALGO_*`，`src/init.cc` 的 `ncclAlgoStr`），`src/config/algorithm_registry.cc` 的 `algRegistry[]` 中也没有 halving/doubling 条目，`grep -riE 'halving|doubling' third_party/nccl/src` 无匹配，所以 NCCL 没有独立的 Halving-Doubling（Rabenseifner）AllReduce；最接近的是 PAT——仅 AllGather/ReduceScatter、仅 Simple，`src/include/collectives.h` 的 `PatRSAlgorithm`/`PatAGAlgorithm` 按 2 的幂维度（`nrPow2`、`firstBitSet`）选对端，是对数步算法。
 
 **17. ★★ 分层 AllReduce 是怎么做的？为什么比平铺的大环好？**
 - 机内 ReduceScatter（NVLink）→ 同号 rank 跨机 AllReduce（每个 rank 走自己的 NIC/rail）→ 机内 AllGather。
 - 书中例题 7.2：两台 HGX 16 rank，连续环跨服务器只用 2 张网卡、720 MiB；交错环所有边跨机、5760 MiB；分层归约 384 MiB 且 8 张网卡并行（书 `07-数据中心网络.md` §7.2.1）。
 - 前提：机内带宽显著高于网卡带宽。
+
+以例题中两台 8 卡服务器为例，三个阶段如下：
+
+```text
+step 1  intra-node ReduceScatter (NVLink)
+        server A: GPU0 GPU1 ... GPU7        server B: GPU0 GPU1 ... GPU7
+        每卡得到 1/8 块的机内部分和
+
+step 2  inter-node AllReduce between same-index ranks, one NIC / rail each
+        A.GPU0 ◄═══ NIC0 / rail0 ═══► B.GPU0
+        A.GPU1 ◄═══ NIC1 / rail1 ═══► B.GPU1
+          ...                           ...
+        A.GPU7 ◄═══ NIC7 / rail7 ═══► B.GPU7      8 张网卡并行
+
+step 3  intra-node AllGather (NVLink)
+        每卡拿回完整结果
+```
 
 **18. ★★ busbw 是什么？为什么 AllReduce 的系数是 2(n−1)/n，All2All 是 (n−1)/n？**
 - algbw = 数据量 / 时间；busbw = algbw × 系数，系数是该操作在最优算法下每卡实际需收发的数据量与用户数据量之比，使 busbw 可与链路带宽直接比较、且不随 n 变。
@@ -119,6 +175,22 @@
 - 源码：`src/device/prims_ll.h`、`prims_ll128.h`、`prims_simple.h`；可用 `NCCL_PROTO` 强制。
 - 待确认：LL128 默认启用的硬件/平台条件；确认方式：阅读 `third_party/nccl/src/tuning/` 中 LL128 相关判断。
 
+两种协议的行格式（LL128 一行按数量示意，flag 在行内的实际位置见 `prims_ll128.h` 的 `NCCL_LL128_FLAGTHREAD`）：
+
+```text
+LL: one ncclLLFifoLine = 16 B
+┌─────────┬─────────┬─────────┬─────────┐
+│ data1   │ flag1   │ data2   │ flag2   │    每 8 B 里 4 B 数据 + 4 B flag，有效约 50%
+└─────────┴─────────┴─────────┴─────────┘
+   4 B       4 B       4 B       4 B
+
+LL128: one line = 128 B = 16 x 8 B
+┌──────────────────────────────┬───────┐
+│ 15 x 8 B data                │ 8 B   │    数据 120 B / 128 B
+│ (NCCL_LL128_DATAELEMS)       │ flag  │
+└──────────────────────────────┴───────┘
+```
+
 **24. ★★ NCCL 如何选择算法和协议？**
 - 对每个 (算法, 协议) 用代价模型估计时间 ≈ 基础延迟 + 硬件延迟 × 步数 + 数据量 / 带宽，选最小者；带宽来自图搜索得到的每 channel 带宽，延迟来自常量表（`src/tuning/` 中 `baseLatencies`、`hwLatencies`，见 `tuning/nvls.cc`、`tuning/collnet.cc`）。
 - 可用 `NCCL_ALGO`、`NCCL_PROTO` 覆盖；也支持 tuner 插件（`src/plugin/`）。
@@ -126,6 +198,18 @@
 **25. ★★ proxy 线程是做什么的？**
 - 网络 transport 下，GPU kernel 把数据放到缓冲并更新 FIFO 中的 tail/head，CPU proxy 线程（`src/proxy.cc` 的 `ncclProxyProgress`）轮询这些状态，调用网络插件 isend/irecv/test 推进收发，再把完成状态写回给 GPU。
 - 机内 P2P/SHM 通常不需要 proxy 参与数据面。proxy 是 CPU 侧瓶颈与抖动来源之一；GPU 发起（GDAKI）可以去掉它（`src/transport/net_ib/gdaki/`）。
+
+网络 transport 下一次发送的推进过程：
+
+```text
+ GPU kernel                  CPU proxy thread               net plugin / NIC
+     │                       (ncclProxyProgress)                 │
+     │ 1. data -> buffer,           │                            │
+     │    update tail/head ────────►│ 2. poll FIFO state         │
+     │                              │ 3. isend / irecv ─────────►│
+     │                              │    test until done ◄───────│
+     │◄──────────────────────────── │ 4. write completion back   │
+```
 
 **26. ★★ NCCL 如何感知拓扑？如何判断两卡能否走 P2P？**
 - 通过 sysfs/NVML 建拓扑图（GPU、PCI 交换、NIC、CPU 节点、NVLink），计算任意两点路径类型（如 NVLink、同 PCIe 交换、跨 CPU 等）。

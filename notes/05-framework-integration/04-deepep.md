@@ -59,6 +59,37 @@ NVLink（scale-up） / InfiniBand（scale-out，推荐自适应路由、独立 V
 - **hook 式通算重叠**：`low_latency_dispatch(..., return_recv_hook=True)` 只发出 RDMA 写就返回，返回一个 `hook`；调用方先去做其他计算（如另一个 micro-batch 的 attention），稍后调用 `hook()` 才执行接收端等待/整理。发出与接收之间**不占用 SM**（数据由 NIC 搬运）。调用点：`third_party/vllm/vllm/model_executor/layers/fused_moe/prepare_finalize/deepep_ll.py`（`return_recv_hook=True`）、`third_party/sglang/python/sglang/srt/layers/moe/token_dispatcher/deepep.py`（`hook() if self.return_recv_hook else event.current_stream_wait()`）。
 - 代价：同节点流量也走网卡，带宽不如 NVLink；buffer 按最大 token 数预留，显存大。
 
+两种模式跨节点的数据路径对比（2 节点 × 4 GPU；t 是 node0 GPU0 上的一个 token，top-k 选中的专家 E 在 node1 的 GPU1、GPU2）：
+
+```text
+ V1 normal：先 RDMA 到远端"同号"GPU（rail 对齐，同一节点只跨网 1 次），再 NVLink 扇出
+
+   node0                          node1
+   ┌──────┐                       ┌──────┐   NVLink   ┌──────┐
+   │ G0 t │════ RDMA (x1) ═══════►│ G0   │───────────►│ G1 E │
+   └──────┘                       └──┬───┘            └──────┘
+                                     │      NVLink    ┌──────┐
+                                     └───────────────►│ G2 E │
+                                                      └──────┘
+
+ V1 low-latency：每个 (token, 专家) 直接发到目标 GPU，跨节点 IBGDA put，无转发
+
+   node0                                              node1
+   ┌──────┐                                           ┌──────┐
+   │ G0 t │═════════════ RDMA put (IBGDA) ═══════════►│ G1 E │
+   │      │                                           └──────┘
+   │      │                                           ┌──────┐
+   │      │═════════════ RDMA put (IBGDA) ═══════════►│ G2 E │
+   └──────┘                                           └──────┘
+
+            normal                                   low-latency
+ 跨节点     RDMA 到同号 GPU，再 NVLink 转发          RDMA 直达目标 GPU
+ 节点内     NVLink（CUDA IPC buffer）                早期走 RDMA；PR #173 后可 NVLink P2P store
+ 接收大小   CPU 等计数后分配，不能 CUDA Graph        固定容量 buffer，可 CUDA Graph
+```
+
+V2.5 的 hybrid 模式保留了 normal 的两跳结构：scaleout warp 用 `gin.put<ncclTeamTagRail>` 跨节点同轨发送，forward warp 经 `ncclTeamTagLsa` 对称指针做 NVLink 转发（见下文源码导读）。
+
 ### 4. V2 / V2.5（本地代码）
 
 - 统一接口：`EPBuffer` 同时覆盖高吞吐与低延迟；按拓扑分 **direct**（scaleout=1，所有 rank 在一个 scale-up 域，直接 NVLink/GIN）与 **hybrid**（scaleout>1，RDMA + NVLink 转发，对应 V1 normal 的分层思想）。
@@ -66,6 +97,22 @@ NVLink（scale-up） / InfiniBand（scale-out，推荐自适应路由、独立 V
 - SM 与 QP 数由解析模型计算（`get_theoretical_num_sms` / `get_theoretical_num_qps`），不再 auto-tune。
 - 重叠改为 **deferred epilogue**：`defer_epilogue=True` + `async_with_compute_stream=True` 时 dispatch/combine 返回 `EventOverlap`，`.wait()`/`current_stream_wait()` 时在当前 stream 上执行收尾（拷贝/整理），中间可插入独立计算。
 - 不再支持 0-SM 的 RDMA LL 路径（hook 期间不占 SM 的能力被移除）。
+
+同样是"发起通信 → 插入别的计算 → 收尾"，V1 LL 的 recv hook 与 V2.5 的 deferred epilogue 在时间线上的区别：
+
+```text
+ V1 LL：low_latency_dispatch(..., return_recv_hook=True)
+
+   compute SM : [dispatch: post RDMA writes][ other micro-batch compute ][ hook(): recv ][ experts ]
+   NIC        :                             [ RDMA writes in flight ═►]
+                                            ↑ 这段时间通信不占 SM，数据由网卡搬运
+
+ V2.5：dispatch(..., async_with_compute_stream=True, defer_epilogue=True) → EventOverlap
+
+   comm stream    : [ dispatch kernel（占 SM）]
+   current stream :        [ independent compute ][ wait(): CPU 等接收计数 + copy epilogue ][ experts ]
+                     ↑ current stream 不等通信 kernel        ↑ event.current_stream_wait() / .wait()
+```
 - 扩展：`lb_prefetch_weights` / `lb_reduce_grads`（冗余专家权重预取、梯度回收）、`BucketBuffer`（CP/DP 的 AG/RS/AR）、`EngramBuffer`、`PPBuffer`——DeepEP 更名为 “DeepEveryParallel”。
 
 ### 5. 与 NVSHMEM 的关系

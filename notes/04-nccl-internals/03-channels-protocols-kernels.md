@@ -30,6 +30,27 @@
 | LL128 | 128B 行中 120B 数据 + 8B flag（`NCCL_LL128_LINESIZE 128`、`NCCL_LL128_DATAELEMS = 15`），每 8 个线程一组，`flagThread = (tid % 8) == 7` 负责 flag；依赖 128B 写入的原子可见性 | 120/128 ≈ 94% | 中等消息，需要 NVLink 等保证 128B 顺序的路径 | `src/device/prims_ll128.h` |
 | Simple | 大块数据 + 显式 `tail/head` 计数同步：写完数据后 fence 再更新计数 | ~100% | 大消息、追求带宽 | `src/device/prims_simple.h`（`waitPeer`、`postPeer`） |
 
+三种协议在一个 slot 里的数据与同步信息布局如下（LL128 中每 8 个线程写一行，每线程 16 B，`tid % 8 == 7` 的线程把自己后 8 B 换成 flag，见 `prims_ll128.h` 中 `store128(..., flagThread ? flag : v[u + 1])`）：
+
+```text
+LL      one 16 B line (union ncclLLFifoLine), one 16 B volatile store
+        byte 0        4        8        12       16
+             ┌────────┬────────┬────────┬────────┐
+             │ data1  │ flag1  │ data2  │ flag2  │      ← 8 B 数据 + 8 B flag：有效 50%
+             └────────┴────────┴────────┴────────┘
+
+LL128   one 128 B line = 16 x uint64, written by 8 threads x 16 B
+        thread  t0       t1              t6       t7
+             ┌────────┬────────┬─ ... ─┬────────┬────┬────┐
+             │  16 B  │  16 B  │       │  16 B  │ 8B │flag│   ← 15 个 u64 数据 + 1 个 u64 flag
+             └────────┴────────┴─ ... ─┴────────┴────┴────┘
+
+Simple  one slot = stepSize bytes of pure data
+             ┌─────────────────────────────────────────────┐
+             │ data ...                                    │   ← 没有内嵌 flag，靠独立的
+             └─────────────────────────────────────────────┘     tail/head 计数同步（第 7 节）
+```
+
 LL128 的启用条件见 `src/tuning/cost_model.cc::isLL128Enabled`：节点内路径需 `<= PATH_NVB`；网络侧 Hopper 及以上可到 `PATH_PXN`（受 `NCCL_LL128_C2C`），否则只到 `PATH_PXB`；cc < 70 禁用。这解释了"PCIe 机器上看不到 LL128"。
 
 ### 算法（`nccl_tuner.h`）
@@ -37,6 +58,30 @@ LL128 的启用条件见 `src/tuning/cost_model.cc::isLL128Enabled`：节点内�
 `TREE 0`、`RING 1`、`COLLNET_DIRECT 2`、`COLLNET_CHAIN 3`、`NVLS 4`、`NVLS_TREE 5`、`PAT 6`；字符串 `ncclAlgoStr = {"Tree","Ring","CollNetDirect","CollNetChain","NVLS","NVLSTree","PAT"}`、`ncclProtoStr = {"LL","LL128","Simple"}`（`src/init.cc:57-59`），即 `NCCL_ALGO`/`NCCL_PROTO` 接受的名字。
 
 ## 源码导读
+
+下图先把第 1~6 节串成一条线：左边是调用线程，右边是 GPU；`ncclGroupEndInternal` 只有在 depth 归零时才往下走（第 2 节）。
+
+```text
+ host thread                                                     GPU
+ ───────────                                                     ───
+ ncclAllReduce (collectives.cc)
+  └ ncclEnqueueCheck
+     ├ ncclGroupStartInternal                  depth + 1
+     ├ ArgsCheck → taskAppend ──► comm->planner
+     └ ncclGroupEndInternal                    depth - 1, continue only if 0
+        └ groupLaunch → groupLaunchLegacy
+           ├ ncclPrepareTasks                  ncclGetAlgoInfo → algo / proto / channels
+           └ doLaunches
+              ├ ncclLaunchPrepare              scheduleCollTasksToPlan / scheduleP2pTasksToPlan
+              ├ ncclLaunchKernelBefore_NoUncapturedCuda     uploadWork
+              ├ ncclLaunchKernel ── cuLaunchKernelEx ══════► grid = nChannels blocks
+              │                                               block b → channelId (channelMask)
+              │                                               ncclKernelMain
+              │                                                └ RunWorkColl<func, algo, proto>
+              │                                                   └ runRing → Primitives
+              └ ncclLaunchKernelAfter_NoCuda
+                 └ hostStreamPlanTask ──► uploadProxyOps + ncclProxyStart   ← 只有需要 proxy 的 plan
+```
 
 ### 1. API → 任务队列
 
@@ -88,6 +133,22 @@ Tree 是 `runTreeUpDown`/`runTreeSplit`（`FanAsymmetric<NCCL_MAX_TREE_ARITY, 1>
 - `waitPeer`：发送方等 `connStepCache + NCCL_STEPS >= step + StepPerSlice`（对端 head 前进，说明有空 slot）；接收方等 tail 前进（有数据）。读计数用 `ld_volatile_global`（注释说明 volatile 比 acquire 快）。
 - `postPeer`：数据写完后更新对端可见的计数（`st_relaxed_sys_global` 写 `tail/head`），需要时先 fence。
 - 自旋超过 `NCCL_SPINS_BEFORE_CHECK_ABORT 10000` 次检查一次 abort 标志（`primitives.h`）。这就是 hang 时 GPU 100% 占用但不前进的原因：kernel 在 `waitPeer` 里自旋。
+
+下图是一条 Simple 连接上 `NCCL_STEPS = 8` 个 slot 的生产者-消费者关系。按 `struct ncclConnInfo` 的注释，`buffs` 和 `tail` 在接收端本地（发送端远程写），`head` 在发送端本地（接收端远程写）。NET 连接中对端的角色由 proxy 承担，见 [04-proxy-and-net-plugin.md](04-proxy-and-net-plugin.md)：
+
+```text
+   sender (send conn)                          receiver (recv conn)
+  ┌────────────────┐                          ┌──────────────────────────────────────┐
+  │                │ ── (2) write slice ────► │ buffs[p], slot = step % NCCL_STEPS   │
+  │                │                          │ ┌───┬───┬───┬───┬───┬───┬───┬───┐    │
+  │                │                          │ │ 0 │ 1 │ 2 │ 3 │ 4 │ 5 │ 6 │ 7 │    │
+  │                │                          │ └───┴───┴───┴───┴───┴───┴───┴───┘    │
+  │                │ ── (3) postPeer: tail ─► │ tail                                 │
+  │ head           │ ◄─ (5) postPeer: head ── │                                      │
+  └────────────────┘                          └──────────────────────────────────────┘
+  (1) sender   waitPeer: connStepCache(head) + NCCL_STEPS >= step + StepPerSlice   ← 有空 slot 才写
+  (4) receiver waitPeer: connStepCache(tail) >= step + StepPerSlice                ← 有数据才读
+```
 
 ## 性能要点与常见坑
 

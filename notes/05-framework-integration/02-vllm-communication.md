@@ -52,6 +52,22 @@ PD:  KVConnectorBase_V1（scheduler 侧 + worker 侧）→ NIXL / Mooncake / LMC
 | `init_distributed_environment`（L1814） | DP>1 或多节点时把 rank 偏移为 `dp_rank*world_size + rank`，调用 `torch.distributed.init_process_group`，建 `_WORLD` |
 | `initialize_model_parallel`（L2056） | `torch.arange(world_size).reshape(-1, dp, pp, pcp, tp)`，对各维 transpose 到末尾得到各组；TP/DCP 组带 `use_message_queue_broadcaster=True`；EP 组带 `use_all2all` |
 
+一个 GroupCoordinator（以 TP 组为例）内部持有的对象，以及谁用 CPU 组、谁用设备组：
+
+```text
+ GroupCoordinator（unique_name 前缀 "tp"）
+ ├─ cpu_group        gloo   ← 元数据、barrier、broadcast_object；各通信器初始化时交换句柄/unique id
+ ├─ device_group     nccl   ← torch.distributed 兜底（ProcessGroupNCCL）
+ ├─ mq_broadcaster   MessageQueue（仅 TP/DCP 组）← 调度输入一写多读：本机 shm 环，远端 zmq
+ └─ device_communicator = CudaCommunicator(cpu_group, device_group, ...)
+     ├─ pynccl_comm      PyNcclCommunicator   ← 经 cpu_group 广播 ncclUniqueId，自建 ncclComm_t
+     ├─ ca_comm          CustomAllreduce      ← 经 cpu_group 交换 cudaIpc 句柄 ┐
+     ├─ symm_mem_comm    SymmMemCommunicator                                   │ 只有 unique_name
+     ├─ fi_ar_comm / fi_pcie_ipc_ar_comm / aiter_ar_comm                       ┘ 前缀为 tp 才启用
+     ├─ qr_comm          QuickAllReduce（ROCm）
+     └─ all2all_manager  按 --all2all-backend 实例化（EP 组，use_all2all）
+```
+
 封装函数：`third_party/vllm/vllm/distributed/communication_op.py` 的 `tensor_model_parallel_all_reduce` / `_all_gather` / `_reduce_scatter` / `_gather` / `broadcast_tensor_dict`，都是 `get_tp_group()` 的薄包装。
 
 ### 2. 后端选择：`third_party/vllm/vllm/distributed/device_communicators/cuda_communicator.py`
@@ -73,6 +89,29 @@ PD:  KVConnectorBase_V1（scheduler 侧 + worker 侧）→ NIXL / Mooncake / LMC
 - `CUSTOM_ALL_REDUCE_MAX_SIZES`（按 compute capability × world size，例如 CC 9.0 下 ws=8 为 256K、ws=2 为 64M）；
 - `NCCL_SYMM_MEM_ALL_REDUCE_CONFIG`（`min_world_size` 4；ws=4 时 16K~512K、ws=8 时 16K~128K 区间优先 custom AR；`always_use_above_world_size` 8）；
 - `should_nccl_symm_mem_allreduce`、`gpu_p2p_access_check`、`can_actually_p2p`。
+
+把上面的顺序和阈值合成一棵 NVIDIA GPU 上的判定树（ROCm 专用的 2、5、7 步略；编号对应上面的列表）。源码里 FlashInfer AR 的条件 `use_fi_ar` 在最前面先算出，它成立时会跳过第 1 步：
+
+```text
+ CudaCommunicator.all_reduce(x)          use_fi_ar = fi_ar_comm 可用 且 should_use_fi_ar(x)
+   │
+ [1] pynccl_comm 存在 且 not use_fi_ar 且 should_nccl_symm_mem_allreduce(ws, x)?
+       VLLM_USE_NCCL_SYMM_MEM 开启，ws >= 4，且
+         ws=4 : bytes <= 16K 或 >= 512K
+         ws=8 : bytes <= 16K 或 >= 128K      ─── 是 ──► all_reduce_symmetric_with_copy
+         ws>8 : 总是                                    （拷入 ncclMemAlloc 窗口，返回非 None 即结束）
+   │ 否
+ [3] fi_pcie_ipc_ar_comm.should_use(x)? ──────── 是 ──► FlashInfer PCIe IPC AllReduce
+ [4] use_fi_ar? ──────────────────────────────── 是 ──► FlashInfer AllReduce
+ [6] ca_comm.should_custom_ar(x)? ────────────── 是 ──► custom AR（1stage / 2stage，见第 4 节）
+       ws <= 8，dtype ∈ {fp32, fp16, bf16}，bytes % 16 == 0，weak contiguous，
+       ws == 2 或 fully_connected，bytes < max_size
+ [8] symm_mem_comm.should_use_symm_mem(x)? ───── 是 ──► torch symm_mem multimem / two-shot
+ [9] pynccl_comm 可用? ───────────────────────── 是 ──► ncclAllReduce（当前 stream）
+ [10] 兜底 ───────────────────────────────────────────► torch.distributed.all_reduce(device_group)
+```
+
+注意 ws=4/8 时 16K~512K / 16K~128K 这段被第 1 步故意让出，留给后面第 6 步的 custom AR（`NCCL_SYMM_MEM_ALL_REDUCE_CONFIG` 注释：这段区间 custom AR 更快）。
 
 ### 3. pynccl：ctypes 直调 NCCL
 
@@ -103,6 +142,42 @@ kernel：`third_party/vllm/csrc/custom_all_reduce.cuh`
 - `cross_device_reduce_2stage`：stage1 reduce-scatter 到各自 tmp buffer，barrier，stage2 allgather（two-shot，字节量更省，适合更大消息）。
 - 选择（`REDUCE_CASE` 宏）：ws==2 用 1stage；全互联下 `(ws<=4 && bytes<512KiB) || (ws<=8 && bytes<256KiB)` 用 1stage，否则 2stage；可被 C++ 侧环境变量 `VLLM_CUSTOM_ALLREDUCE_ALGO`（`1stage|oneshot|2stage|twoshot`）强制。
 - barrier/`Signal`/`RankData` 定义在 `third_party/vllm/csrc/custom_collective_common.cuh`；绑定在 `third_party/vllm/csrc/custom_all_reduce.cu`。
+
+每个 rank 的两块 IPC 共享显存，以及 `Signal` 的布局（同节点情况；对端的同名块经 IPC 句柄映射进本进程）：
+
+```text
+ meta_ptrs[r]：meta_size() + max_size，uncached          buffer_ptrs[r]
+ ┌────────────────────────────────┬──────────────┐       ┌──────────────────────────┐
+ │ Signal                         │ tmp buffer   │       │ pre-registered IPC buf   │
+ │  start[kMaxBlocks][ranks]      │ (max_size)   │       │ eager: input copied here │
+ │  end  [kMaxBlocks][ranks]      │ 2stage: RS   │       └──────────────────────────┘
+ │  _flag[kMaxBlocks]             │ result slot  │
+ └────────────────────────────────┴──────────────┘
+   kMaxBlocks = 36；get_tmp_buf(sg) = (Signal*)sg + 1，即 tmp 紧跟在 Signal 后面
+   rank_data：8 MiB 设备数组，存 RankData{ptrs[ranks]}，每个已注册 buffer 一组"各 rank 地址"
+
+ barrier_at_start（block b、rank r，flag = _flag[b] + 1）：
+   thread p (< ngpus) ── 写 ───► 对端 p 的 Signal.start[b][r] = flag
+   thread p           ── 自旋 ─► 自己的 Signal.start[b][p] == flag
+   end[][] 是第二套计数器，供 barrier_at_end 用：快的对端可能已到第二次同步并写 flag，
+   若共用 start[][] 会干扰本卡仍在等的第一次同步（源码 Signal 注释）
+```
+
+1stage 与 2stage 读写的数据对比（ws=4，每个 rank 的输入按 4 段记为 A/B/C/D）：
+
+```text
+            rank0 in        rank1 in        rank2 in        rank3 in
+           [A0|B0|C0|D0]   [A1|B1|C1|D1]   [A2|B2|C2|D2]   [A3|B3|C3|D3]
+
+ 1stage    barrier_at_start
+           every rank: result = in0 + in1 + in2 + in3   （经 NVLink 读 3 个对端全长）
+           barrier_at_end
+
+ 2stage    barrier_at_start
+           stage1 RS : rank0 tmp = A0+A1+A2+A3   rank1 tmp = B0+..+B3   ...
+           barrier_at_end
+           stage2 AG : every rank: result = [tmp@r0 | tmp@r1 | tmp@r2 | tmp@r3]
+```
 
 其他 AllReduce 后端：
 - `symm_mem.py` `SymmMemCommunicator`：PyTorch symmetric memory rendezvous，按 CC 与 world size 用 `torch.ops.symm_mem.multimem_all_reduce_`（NVSwitch multicast/NVLS）或 `two_shot_all_reduce_`；开关 `VLLM_ALLREDUCE_USE_SYMM_MEM`（默认 1）。

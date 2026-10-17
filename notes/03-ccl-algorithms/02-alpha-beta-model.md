@@ -50,6 +50,7 @@ T_ring = 2(n-1)·α + 2(n-1)/n·M·β + (n-1)/n·M·γ
 - β 项贴近下界、与 n 基本无关；α 项随 n 线性增长。
 - 只和两个邻居通信，容易映射到物理拓扑（NVLink 环、每节点只跨一次网卡），且可以切 chunk 流水、开多个 channel 并行跑多个环。
 - ai-infra-book 6.4.2 节式 (6-9) 与此相同；书里的发送顺序让 ReduceScatter 结束时卡 r 持有块 r+1，`labs/ccl_sim` 里改成持有块 r（满足 ReduceScatter 的对外语义），二者只差一个旋转。
+- N = 4 时每一步谁发哪一块、各 rank 持有哪些部分和的逐步图，见 [05-handwrite-ring-fullmesh.md](05-handwrite-ring-fullmesh.md) 题 1。
 
 #### Recursive Doubling（蝶形）
 
@@ -70,6 +71,23 @@ T_HD = 2·log₂ n·α + 2(n-1)/n·M·β + (n-1)/n·M·γ
 - 那为什么 NCCL 主力是 Ring？模型没算进去的东西：①伙伴距离是 2^k，大部分轮次不是物理邻居，在环形/分层拓扑上会和别人抢同一条链路；②要和 log₂ n 个不同的伙伴建连接、各占一份缓冲；③每轮消息大小不同，不利于固定 chunk 流水和多 channel 铺满；④非 2 的幂要折叠。这些在 NVSwitch 全交换的节点内影响小，在跨节点时影响大。
 - `labs/ccl_sim` 中 N 不是 2 的幂时 `halving_doubling_allreduce` 刻意抛 `ValueError`。
 
+下图按 `labs/ccl_sim` 的 `halving_doubling_allreduce` 的规则（rank r 与 r XOR mask 配对，mask 位为 0 的保留下半区间）逐步画出 N = 4 时每个 rank 持有的块。bK(02) 表示"块 K，已累加 rank 0、2 的贡献"，bK(*) 表示 4 份全齐：
+
+```text
+             rank 0          rank 1          rank 2          rank 3
+init         b0 b1 b2 b3     b0 b1 b2 b3     b0 b1 b2 b3     b0 b1 b2 b3
+RS mask=2    0◄─►2、1◄─►3：mask 位为 0 的留下半发上半，为 1 的相反；每 rank 发 M/2 并累加
+  hold       b0(02) b1(02)   b0(13) b1(13)   b2(02) b3(02)   b2(13) b3(13)
+RS mask=1    0◄─►1、2◄─►3：当前区间再对半分；每 rank 发 M/4 并累加
+  hold       b0(*)           b1(*)           b2(*)           b3(*)
+AG mask=1    0◄─►1、2◄─►3：交换各自持有的区间（覆盖写）；每 rank 发 M/4
+  hold       b0 b1           b0 b1           b2 b3           b2 b3
+AG mask=2    0◄─►2、1◄─►3：区间再翻倍；每 rank 发 M/2
+  hold       b0 b1 b2 b3     b0 b1 b2 b3     b0 b1 b2 b3     b0 b1 b2 b3
+```
+
+每 rank 发送 M/2 + M/4 + M/4 + M/2 = 1.5·M = 2(n-1)/n·M，轮数 2·log₂4 = 4。mask=2 那一轮的伙伴距离为 2：在环形拓扑上它不是物理邻居，这就是上面"链路争用"一条的来源。
+
 #### Binary Tree 与 Double Binary Tree
 
 AllReduce = Reduce 到根 + Broadcast。不切块时每轮都传完整 M：
@@ -81,6 +99,24 @@ AllReduce = Reduce 到根 + Broadcast。不切块时每轮都传完整 M：
 
 1. **切块流水**：把 M 切成 k 块，第一块到根后，后面的块在不同层上同时流动。单棵树单阶段 ≈ (D + k - 1)·(α + M/k·β)，D 为深度。k 越大 β 项越接近 M·β，但 α 次数越多；最优 k* ≈ √((D-1)·M·β/α)。
 2. **Double Binary Tree**（NCCL Tree）：一棵二叉树里约一半节点是叶子，叶子的"收"端口闲着、内部节点的端口却要承担两个孩子。NCCL 用两棵互补的树，各负责一半数据：`third_party/nccl/src/graph/trees.cc` 的 `ncclGetDtree` 注释写明，第二棵树在 nranks 为偶数时取第一棵的镜像（rank → nranks-1-rank），为奇数时整体平移一位。这样每个 rank 在一棵树里是内部节点、在另一棵里是叶子，负载均衡。
+
+按 `ncclGetBtree` 的位运算规则手算 nranks = 8 的两棵树（第二棵是 rank → 7 - rank 的镜像）如下，可以对照 `third_party/nccl/src/graph/trees.cc` 注释中 12 rank 的图：
+
+```text
+tree 0 (ncclGetBtree)                tree 1 (mirror: rank -> 7 - rank)
+
+        0                                    7
+        │                                    │
+        4                                    3
+      ┌─┴─┐                                ┌─┴─┐
+      2   6                                1   5
+     ┌┴┐ ┌┴┐                              ┌┴┐ ┌┴┐
+     1 3 5 7                              0 2 4 6
+
+inner: 0 4 2 6   leaf: 1 3 5 7            inner: 7 3 1 5   leaf: 0 2 4 6
+```
+
+每个 rank 恰好在一棵树里是内部节点（rank 0、7 作为根只有一个孩子）、在另一棵里是叶子；两棵树各承担一半数据。注意 NCCL 实际是在节点之间建这两棵树、节点内走链（见下文 `tree.cc` 的延迟项），上图只演示 rank 编号的构造规则。
 
 简化模型（`cost_model.double_binary_tree_allreduce`，Reduce 与 Broadcast 不重叠）：
 
@@ -94,7 +130,7 @@ T_DBT(k) ≈ 2·(D + k - 1)·(α + M/k·β)，D = ⌈log₂ n⌉
 适用于 AllGather 与 All2All，且对任意 n 都是 ⌈log₂ n⌉ 轮。
 
 - AllGather：第 k 轮把已有的 2^k 个块发给 r - 2^k，最后本地旋转。T ≈ ⌈log₂ n⌉·α + (n-1)/n·M·β，延迟和带宽都贴近下界。
-- All2All：第 k 轮把"目的 rank 编号第 k 位为 1"的所有块一起发给 r + 2^k，每轮约发 M/2。T ≈ ⌈log₂ n⌉·(α + M/2·β)：用 log₂ n/2 倍的字节换来 log 级的轮数，只在小消息、rank 多时划算（见 [04-all2all.md](04-all2all.md)）。
+- All2All（标准 Bruck，算法通识，非本地源码）：先本地旋转，使第 j 个块对应相对偏移 (j − r) mod n；第 k 轮把"相对偏移第 k 位为 1"的所有块打包发给 (r + 2^k) mod n（同时从 (r − 2^k) mod n 收）；最后做一次逆旋转把块放回按源 rank 排列。每轮约发 M/2。T ≈ ⌈log₂ n⌉·(α + M/2·β)：用 log₂ n/2 倍的字节换来 log 级的轮数，只在小消息、rank 多时划算（见 [04-all2all.md](04-all2all.md)）。
 
 #### 二维 / 分层（hierarchical）
 
@@ -103,6 +139,23 @@ T_DBT(k) ≈ 2·(D + k - 1)·(α + M/k·β)，D = ⌈log₂ n⌉
 1. 节点内 Ring ReduceScatter：每个 rank 得到本节点归约结果的 1/g。
 2. 节点间：持有同一分片的 h 个 rank（每节点一个，各走自己那条 rail）做 AllReduce，消息只有 M/g。
 3. 节点内 Ring AllGather。
+
+下图以 g = 4、h = 2 为例，s_i 表示"buffer 的第 i 段（M/g）"：
+
+```text
+step 1  intra-node Ring ReduceScatter (α_i, β_i)
+          node 0:  G0  G1  G2  G3            node 1:  G0  G1  G2  G3
+                   s0  s1  s2  s3                     s0  s1  s2  s3      ← Gi 持有本节点和的第 i 段
+
+step 2  inter-node AllReduce on M/g, one group per rail, 4 rails in parallel (α_e, β_e)
+          rail 0:  node0.G0  ◄═══ net ═══►  node1.G0      AllReduce(s0)
+          rail 1:  node0.G1  ◄═══ net ═══►  node1.G1      AllReduce(s1)
+          rail 2:  node0.G2  ◄═══ net ═══►  node1.G2      AllReduce(s2)
+          rail 3:  node0.G3  ◄═══ net ═══►  node1.G3      AllReduce(s3)
+
+step 3  intra-node Ring AllGather
+          node 0:  G0..G3 all hold s0 s1 s2 s3      node 1:  same
+```
 
 T_hier = 2(g-1)·α_i + 2(g-1)/g·M·β_i + 2(h-1)·α_e + 2(h-1)/h·(M/g)·β_e
 
@@ -125,6 +178,27 @@ T_hier = 2(g-1)·α_i + 2(g-1)/g·M·β_i + 2(h-1)·α_e + 2(h-1)/h·(M/g)·β_e
 | 分层 AllReduce | 2(g-1) + 2(h-1) | 节点内 2(g-1)/g·M，节点间 2(h-1)/h·M/g | 节点内外带宽差距大 |
 
 交叉点：令两式相等即可。例如 Ring 与 RD（n = 8）：11α = 1.25·M·β → M* ≈ 8.8·α·B。α = 5 μs、B = 25 GB/s 时 α·B ≈ 122 KiB，M* ≈ 1.07 MiB；`python3 -m labs.ccl_sim` 的表里 1 MiB 一行 Ring 143.4 μs、RD 140.8 μs，正好在交叉点附近。ai-infra-book 6.4.2 节用 α = 0.822 μs、B = 450 GB/s 算出 8 卡 Ring 与二项树的交叉点约 680 KiB。
+
+把这个例子画成 log-log 示意图（n = 8，只示意形状，不按比例）：每条曲线在小消息端是一条水平线（α 项），在大消息端变成斜率为 1 的直线（β 项）。RD 的水平线低、斜线高，Ring 相反，于是两条线必然相交一次：
+
+```text
+ log T
+   ▲
+   │                                                    ╱  RD   ≈ log₂n·M·β = 3·M·β
+   │                                                  ╱  ╱  Ring ≈ 2(n-1)/n·M·β = 1.75·M·β
+   │                                                ╱  ╱
+   │                                              ╱  ╱
+   │                                            ╱  ╱
+   │ Ring 14α  ───────────────────────────────●───      ← 交叉点 M* ≈ 8.8·α·B
+   │                                        ╱
+   │                                      ╱
+   │                                    ╱
+   │ RD    3α  ────────────────────────
+   │
+   └──────────────────────────────────┬───────┬─────────────────────────────► log M
+                                     α·B      M*
+   ◄──── 小消息：比轮数（α 项）────►       ◄──── 大消息：比总字节（β 项）────►
+```
 
 ### algbw 与 busbw（nccl-tests 口径）
 

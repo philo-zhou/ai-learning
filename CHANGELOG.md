@@ -6,6 +6,10 @@
 
 ### Added
 
+- **RDMA 建链与端到端发包** — `notes/01-rdma/01-verbs-basics.md` 新增 RDMA CM 建链一节（REQ/REP/RTU 时序、CM 事件 / CM 消息 / QP 状态三套状态的对照、RTU 与 RTR/RTS 的区别、与手工建链对比），依据 `third_party/rdma-core/librdmacm/cma.c`；`notes/01-rdma/02-transport-and-ops.md` 新增一次 RDMA WRITE_WITH_IMM 的端到端流程（MR/lkey/rkey、WQE 各段布局、doorbell、组包与 PSN、rkey 校验、CQE owner 位、出错表），依据 mlx5 provider 源码。
+- **RoCE QoS 配置** — `notes/01-rdma/03-roce-ib-congestion.md` 新增两节：PFC 帧、CNP、RoCEv2 数据、TCP 的优先级顺序与队列关系，以及网卡侧配置命令（`mlnx_qos`、ECN sysfs、`pfc-prevention-tout`、iproute2 `dcb`、计数器验证）与常见取值；配套调研 `docs/references/2026-10-17-roce-qos-config.md`（12 条结论，逐条标注一手来源与置信度）；术语表新增 PFC/ECN/CNP/ETS。
+- **笔记配图** — 全部 49 篇笔记新增约 110 张 ASCII 示意图（原语前后状态、Ring/Tree/Halving-Doubling 逐步图、QP 状态机、DCQCN/PFC 反馈环、GDR 数据路径、NCCL init/bootstrap 时序、LL/LL128/Simple 布局、proxy 握手、vLLM 后端选择树、TBO 时序、DeepEP 缓冲区布局、通算融合的重叠层次时间线、AG+GEMM 信号与 swizzle、GEMM+RS 计数器判定、对称堆布局、GIN 强/弱信号等），图中涉及的源码细节对照 `third_party/` 本地克隆核实。
+- **PD 分离 + AF 分离全流程** — `notes/05-framework-integration/06-pd-af-end-to-end.md`：一次请求从 prefill、KV 传输到 AF 分离 decode 的逐层流程图，每层 QKV 与 KV cache 的计算/复用、MoE dispatch/combine 的含义与使用场景、AF 分离为何只用于 MoE 的 decode、prefill 与 decode 的 token 用量对照表、通信清单；配套调研 `docs/references/2026-10-17-megascale-infer-phase.md`，以及 vLLM KVConnector、SGLang disaggregation 的源码位置。
 - **Ring / Full-mesh 手写题** — `notes/03-ccl-algorithms/05-handwrite-ring-fullmesh.md`：Ring 与 Full-mesh 各原语的伪代码、GPU one-shot / two-shot kernel 与追问；`labs/ccl_sim` 新增 `fullmesh_*` 模拟与代价模型（CLI 表格新增 `fm_oneshot`、`fm_twoshot` 两列）及 `TestFullMesh` 测试。
 - **学习站点** — `site/`：VitePress 直接渲染 `notes/`、`docs/references/` 与术语表，技术手册风格主题（暖白/深墨蓝、三层知识色标）、首页路线卡片、中文全文搜索、公式渲染；`cd site && npm install && npm run dev` 启动，`npm run build` 构建并自检；`.github/workflows/deploy-site.yml` 把站点发布到 GitHub Pages（https://philo-zhou.github.io/ai-learning/）。`scripts/check_repo.py` 改为跳过 `site/node_modules` 与构建产物。
 - **EP 专用通信库专章** — `notes/09-ep-kernels/`：EP All2All 设计空间、DeepEP low-latency（固定槽位、同 QP 计数、IBGDA、recv hook、LogFMT）、Hybrid-EP（路由预计算、分层 RDMA/NVLink、TMA warp 专业化、节点内预归约）、谱系与选型；外部资料新增 `DeepEP-hybrid-ep`（上游 `hybrid-ep` 分支 @10d4dd73）。

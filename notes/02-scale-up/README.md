@@ -20,6 +20,21 @@ scale-up 是"一个互联域内的加速器像共享一块大内存那样协作"
 | [01-nvlink-nvswitch.md](01-nvlink-nvswitch.md) | NVLink/NVSwitch/NVL72 概念、与 PCIe 对比、scale-up 与 scale-out 的分工 |
 | [02-nccl-p2p-shm-nvls.md](02-nccl-p2p-shm-nvls.md) | NCCL 的 P2P / SHM / NVLS transport 源码导读、CUDA IPC 与 cuMem、MNNVL、NVLS multicast 与 SHARP 式归约 |
 
+两篇的关系：左边是 01 讲的硬件路径，右边是 02 讲的 NCCL 用法和源码位置（路径相对 `third_party/nccl/src/`）。
+
+```text
+  hardware path (01)                        NCCL mechanism (02)
+  ──────────────────                        ───────────────────
+  NVLink / NVSwitch  ── load/store ────────► P2P       transport/p2p.cc   (CUDA IPC / cuMem)
+                     ── multicast + SHARP ─► NVLS      transport/nvls.cc, multicast.cc
+  MNNVL (cross-node  ── fabric handle ─────► P2P/MNNVL mnnvl.cc           (CU_MEM_HANDLE_TYPE_FABRIC)
+         NVLink)
+  PCIe P2P           ── within P2P_LEVEL ──► P2P       (default up to PXB)
+  host shared memory ── GPU->host->GPU ────► SHM       transport/shm.cc
+  copy engine        ── no SM used ────────► P2P/CE, CE collectives  ce_coll.cc
+  NIC (scale-out)    ── RDMA ──────────────► NET       see ../01-rdma/
+```
+
 ## 与岗位的关系
 
 "基于 scale-up 互联研发通信库"意味着要能回答：给定一个 NVLink/NVSwitch 或自研 scale-up 域，如何（1）建立跨 GPU 的内存映射（IPC、fabric handle），（2）设计 load/store 还是 copy engine 还是 multicast 的数据路径，（3）在 kernel 里做同步与流控，（4）把它接入通信库的拓扑、选算法与 transport 框架。NCCL 的 `p2p.cc`、`nvls.cc`、`mnnvl.cc`、`ce_coll.cc` 正好覆盖这四个问题，是最好的参考实现。

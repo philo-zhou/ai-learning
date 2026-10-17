@@ -31,6 +31,22 @@
 - 中间段：PCIe（书中 Gen5 x16 每方向 64 GB/s，Gen4 32 GB/s），以及 GPU-NIC 是否在同一 PCIe 交换芯片下（PIX/PXB）还是要过 CPU（PHB/SYS）。
 - busbw 是归一化后的"每 rank 链路带宽"，应和单 rank 的瓶颈链路比较；书中提醒它不等于每张网卡的实际吞吐，分层通信、交换机内归约（NVLS/SHARP）会改变实际流量，所以 NVLS 下 busbw 可能高于单 GPU NVLink 单向带宽的直觉值。
 
+把上面几段链路画在一台机器上，找出单个 rank 的瓶颈段（数字为书中 H100/DGX 例，每方向）：
+
+```text
+  GPU0 ════ NVLink 450 GB/s ════ NVSwitch ════ GPU1..7           ← 节点内理论值
+    │
+    │ PCIe Gen5 x16: 64 GB/s   (Gen4: 32 GB/s)
+    ▼
+  ┌─────────────┐
+  │ PCIe switch ├──► NIC 400 Gbit/s ~ 50 GB/s ──► network        ← 节点间理论值
+  └──────┬──────┘    (PIX/PXB: NIC under the same PCIe switch)      × 该 GPU 可用网卡数
+         │
+         │ PHB/SYS: GPU-NIC traffic goes through the CPU         ← 多出 CPU / UPI 一段
+         ▼
+        CPU ── UPI ── CPU ── PCIe ── NIC
+```
+
 ### 3. 就绪偏差与重叠
 
 - ai-infra-book 7.6.1："关键路径从数据就绪开始"：一张卡早进入集合通信调用、另一张卡梯度还没算完，等待会被记到通信耗时里，根源却在前面的计算或主机操作（书中引用 MegaScale 的观察）。在 profile 中看到某 rank 的 AllReduce 特别长，先看其他 rank 是否晚到。
@@ -55,6 +71,26 @@
 
 ## 方法步骤
 
+六步的先后关系：先有可复现基线，再定位、核查、确认，A/B 只用来验证假设，最后回到真实负载。
+
+```text
+  Step 1 baseline        nccl-tests full size sweep, fixed env and rank layout
+     │
+     ▼
+  Step 2 locate          busbw / time vs theory: bandwidth or latency? intra or inter node?
+     │
+     ├──► Step 3 topology      nvidia-smi topo -m, NCCL_TOPO_DUMP_FILE, NUMA, NIC rail
+     ├──► Step 4 NCCL logs     NCCL_DEBUG=INFO + SUBSYS: transport, channels, GDR, algo
+     │         │
+     │         ▼
+     └──► Step 5 A/B           change ONE variable, compare full curves (locate only)
+               │
+               ▼
+  Step 6 real workload   nsys / NVTX / profiler plugin: overlap, readiness skew
+     │
+     └──► abnormal (hang / error / wrong data) ──► 03-troubleshooting.md
+```
+
 ### Step 1 固定环境，跑基线
 
 1. 记录：NCCL/驱动/CUDA 版本、GPU 型号、网卡型号与固件、rank 布局（每节点几 rank、每 rank 绑哪块 GPU 和 CPU 核）。
@@ -64,6 +100,20 @@
 5. 加大 `-w` 消除懒连接影响；`-I 1` 看迭代抖动；`-a 2/3` 找慢 rank。
 
 ### Step 2 对比理论值，定位哪一段
+
+下面四条可以看成一棵决策树：
+
+```text
+  nccl-tests result vs theory
+  │
+  ├─ large msg busbw low ──────────► bandwidth: transport (SHM / Socket / no GDR?),
+  │                                   channel count, NIC choice, PCIe path
+  ├─ small msg time high ──────────► latency: algo (Tree/NVLS/PAT usable?), proto (LL/LL128),
+  │                                   CPU pinning, proxy preempted, host memory path
+  ├─ intra-node OK, inter-node bad ► network: IB rate / errors, GDR, PXN, ECMP / PFC
+  │   (NCCL_TESTS_SPLIT "DIV 8" vs "MOD 8")
+  └─ few nodes drag everyone ──────► -a 2/3, pairwise sendrecv / all_reduce bisection
+```
 
 - 大消息 busbw 明显低于节点内 NVLink 或节点间网卡的理论值 → 带宽问题：查 transport（是否误走 SHM/Socket/无 GDR）、通道数、网卡选择、PCIe 路径。
 - 小消息 time 明显偏高 → 延迟问题：查算法（Tree/NVLS/PAT 是否可用）、协议（LL/LL128 是否被禁用）、CPU 绑核、proxy 线程是否被抢、是否走了 host 内存。

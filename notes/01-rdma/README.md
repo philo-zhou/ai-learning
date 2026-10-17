@@ -37,6 +37,20 @@ RNIC 硬件：传输层（RC 可靠性/重传）、拥塞控制（DCQCN 等）�
 | [04-perftest.md](04-perftest.md) | ib_write_bw/ib_write_lat/ib_send_bw 用法、参数、结果解读、源码结构 |
 | [05-gpudirect-and-nccl-ib.md](05-gpudirect-and-nccl-ib.md) | GPUDirect RDMA（nvidia-peermem / dmabuf）、NCCL net_ib 建链/MR/多 QP/GDR 判断、NCCL_IB_* 环境变量 |
 
+把上面的调用链和五篇笔记对起来，每一层由哪篇负责（左列从上到下就是调用链）：
+
+```text
+  layer (top -> bottom)                  note   重点
+  ─────────────────────────────────────  ─────  ─────────────────────────────────────────
+  NCCL net_ib transport                  05     建链状态机、MR cache、CTS + WRITE_IMM、多 QP
+  GPUDirect RDMA (peermem / dmabuf)      05     GDR 判断、flush
+  perftest (peer of NCCL, uses verbs)    04     不经过通信库的网卡标尺、结果解读
+  libibverbs API                         01     PD/MR/CQ/QP、QP 状态机、建链信息交换
+  provider (mlx5): WQE / doorbell        02     QP 类型、opcode 语义、inline、signal、doorbell
+  RNIC transport (RC, retransmit)        02/03  RC 可靠性；Go-back-N vs 选择重传
+  switch network (IB / RoCEv2)           03     PFC / ECN / DCQCN、incast、ECMP 冲突
+```
+
 建议阅读顺序：01 → 02 → 04（边读边跑 perftest）→ 03 → 05。
 
 ## 面试自测（问题 + 要点答案）

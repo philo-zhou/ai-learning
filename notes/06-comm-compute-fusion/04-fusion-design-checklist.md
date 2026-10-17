@@ -8,6 +8,28 @@
 
 设计一个通算融合算子，先回答"值不值得融"（收益上限），再回答六件事：切多细、靠什么信号表达依赖、分多少 SM、内存序对不对、拓扑怎么映射、怎么证明正确与更快。
 
+下图是决策流程：先估收益上限，收益值得时再进入七步设计清单。
+
+```text
+┌────────────────────────────────────────┐
+│ 0. upper bound = min(T_comm, T_comp)   │
+│    minus pipeline fill and drain       │
+└──────────────────┬─────────────────────┘
+                   ▼
+   T_comm and T_comp close, and bottleneck is not shared egress?
+   ├── no ──► upper bound low: only cut launches (CUDA Graph, persistent kernel, low-latency algorithm)
+   └── yes ──►
+              ┌────────────────────────────────────────────────────┐
+              │ 1. granularity   (tile / row segment)              │
+              │ 2. signals       (producer, consumer, value)       │
+              │ 3. SM split      (compute SM = total - comm SM)    │
+              │ 4. memory order  (release / acquire, fence)        │
+              │ 5. topology      (NVLink domain / rail)            │
+              │ 6. correctness   (reference, stress, straggler)    │
+              │ 7. benchmark     (serial / stream overlap / fused) │
+              └────────────────────────────────────────────────────┘
+```
+
 ## 在调用链中的位置
 
 - 输入：上层层（TP MLP、MoE 层）给出的 shape、并行度、拓扑。
@@ -37,6 +59,17 @@
 - [ ] 信号复用：多次调用之间如何区分？Triton-distributed 的 EP all2all 用 `call_count` 当信号值并做 `call_count % 2` 双缓冲；其他做法是每轮清零（要保证清零与上一轮读取之间的顺序）。
 - [ ] 完成语义：单个 put 完成 vs 所有此前 put 完成。NCCL GIN 明确区分强/弱信号（`third_party/nccl/src/include/nccl_device/gin.h`）：要让一个信号代表"一批数据到齐"必须用强信号或先 flush。
 - [ ] 避免死锁：消费者等的信号，其生产者是否一定会被调度？persistent kernel 或占满全部 SM 的 kernel 会让"生产者 kernel 没有 SM 可用"，经验上要给通信侧预留 SM（见 3）。同 stream 串行时，等信号的 kernel 永远等不到后发的生产者。
+
+下图示意死锁成因：consumer 等信号，但 producer 没有 SM 可执行或尚未被调度。
+
+```text
+┌───────────────────┐    ┌───────────────────┐
+│ consumer kernel   │    │ producer kernel   │
+│ wait(signal)      │◄───│ set signal        │
+└───────────────────┘    └───────────────────┘
+   SM 已用满                占不到 SM / stream 顺序后面 / grid 过大
+```
+
 - [ ] 超时与可观测：DeepEP 有 GPU 端超时（`num_gpu_timeout_cycles`，见 `third_party/DeepEP/csrc/kernels/comm/context.cpp`）；Triton-distributed 测试有 `--verify_hang`（`docs/testing.md`）。自己写时也应有超时断言，而不是无限自旋。
 
 ### 3. SM 分配与资源争用

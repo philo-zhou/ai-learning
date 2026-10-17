@@ -15,6 +15,15 @@
 | [03-nvshmem-and-device-initiated.md](03-nvshmem-and-device-initiated.md) | NVSHMEM 概念、DeepEP 与 Triton-distributed 的用法、NCCL device API / GIN 导读 | 已写 |
 | [04-fusion-design-checklist.md](04-fusion-design-checklist.md) | 设计通算融合算子的检查清单与测试/基准方法 | 已写 |
 
+下图是本章四篇笔记的阅读顺序，以及每篇回答的问题。
+
+```text
+┌─────────────────┐   ┌──────────────────┐   ┌──────────────────────┐   ┌──────────────────┐
+│ 01 taxonomy     │──►│ 02 triton-dist   │──►│ 03 nvshmem           │──►│ 04 checklist     │
+└─────────────────┘   └──────────────────┘   └──────────────────────┘   └──────────────────┘
+ 重叠/融合五层分类       tile 级融合怎么写       device-initiated 底座       怎么设计、测试、基准
+```
+
 相关章节：[笔记总入口](../00-roadmap/README.md)、[01-rdma](../01-rdma/README.md)（device-initiated 通信最终落到的 NIC/QP 机制）、[04-nccl-internals](../04-nccl-internals/README.md)、[05-framework-integration](../05-framework-integration/README.md)（DeepEP 与推理框架如何调用）、[07-perf-troubleshooting](../07-perf-troubleshooting/README.md)、[08-interview](../08-interview/README.md)、[JD 拆解](../00-roadmap/02-jd-breakdown.md)、[学习路线](../00-roadmap/03-learning-path.md)。
 
 ## 为什么需要通算融合
@@ -36,6 +45,19 @@
 - 传统 NCCL kernel 本身占 SM、占 HBM 带宽；重叠后矩阵乘变慢。书中第 6.4.3 节：实验 6-5 里 64 MiB 通信与矩阵乘同时运行只省约 2.7 ms，而不是矩阵乘的全部 11 ms，原因就是资源争用。
 - 第 9.4.3 节同样指出：网卡 DMA 与 GEMM 争用 HBM，使 dispatch/combine 各慢约 49% 时，两 micro-batch 流水收益完全消失。
 - 所以通算融合不只是"并发"，还要回答"通信占几个 SM、占多少 HBM 带宽、能否换成 copy engine"。见 [01-overlap-taxonomy.md](01-overlap-taxonomy.md)。
+
+下图把上面三类问题和面试自测第 2 题的三类收益来源对应起来。
+
+```text
+ problem                          gain source
+┌───────────────────────┐       ┌───────────────────────┐
+│ exposed comm          │──────►│ hide time behind comp │   ← 通信暴露在关键路径 → 隐藏时间
+├───────────────────────┤       ├───────────────────────┤
+│ launch / host handoff │──────►│ cut fixed cost        │   ← launch 与主机交接 → 降低固定开销
+├───────────────────────┤       ├───────────────────────┤
+│ SM / HBM contention   │──────►│ free SMs / use CE     │   ← SM 争用 → 让出 SM 或改走专用引擎
+└───────────────────────┘       └───────────────────────┘
+```
 
 ## 面试自测
 

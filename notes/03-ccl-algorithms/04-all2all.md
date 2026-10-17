@@ -27,8 +27,43 @@ rank r 的发送缓冲分成 n 段，第 j 段发给 rank j；结束时 rank r �
 |---|---|---|---|
 | 直接 P2P（一次全部发出） | 1 轮（n-1 条并发消息） | (n-1)/n·M | 所有 Send/Recv 一起提交，由硬件/调度器并发推进；n 大时同时在途的连接多、易拥塞（incast） |
 | Pairwise（逐对） | n-1 | (n-1)/n·M | 第 s 轮 rank r 发给 (r+s) mod n、收自 (r-s) mod n（2 的幂时也常用 r XOR s）；每轮每 rank 恰好一收一发，端口无冲突。`labs/ccl_sim` 的 `pairwise_all2all(v)` |
-| Bruck | ⌈log₂ n⌉ | ≈ ⌈log₂ n⌉·M/2 | 第 k 轮把"目的编号第 k 位为 1"的所有块打包发给 r+2^k；用约 log₂ n/2 倍的字节换 log 级轮数，只适合小消息、n 大 |
+| Bruck | ⌈log₂ n⌉ | ≈ ⌈log₂ n⌉·M/2 | 先本地旋转，第 k 轮把"相对偏移 (j−r) mod n 第 k 位为 1"的所有块打包发给 (r+2^k) mod n，最后逆旋转（标准 Bruck，算法通识）；用约 log₂ n/2 倍的字节换 log 级轮数，只适合小消息、n 大 |
 | 分层（两阶段） | 节点内 + 节点间 | 跨节点字节不变 | 先在节点内按"目的节点"重排、聚合，使每个 rank 只负责发往若干节点的数据，再跨节点交换，最后节点内分发；把 n·(h-1) 条小消息合并成更少的大消息，并让同一 rail 上的网卡各自工作 |
+
+Pairwise 的调度可以画成 n × n 的块矩阵：行是发送方 i，列是接收方 j，格子里写"块 i→j 在第几轮发出"，按上表规则它等于 (j - i) mod n。n = 4：
+
+```text
+                 dst 0   dst 1   dst 2   dst 3
+    src 0          .       1       2       3
+    src 1          3       .       1       2
+    src 2          2       3       .       1
+    src 3          1       2       3       .        "." = 本地块，直接拷贝
+
+    round s=1: 0→1  1→2  2→3  3→0
+    round s=2: 0→2  1→3  2→0  3→1
+    round s=3: 0→3  1→0  2→1  3→2
+```
+
+每个轮号在每一行、每一列都恰好出现一次：每轮每个 rank 正好发一条、收一条，所以端口无冲突。直接 P2P 相当于把 1、2、3 三轮的格子同时发出，每个接收端同一时刻要接 n-1 条流。
+
+表中"分层（两阶段）"一行的数据流示意如下（只画 node A 发出的数据）：
+
+```text
+node A (g ranks)
+  G0   G1  ...  G(g-1)          each rank holds data for every destination rank
+   │    │         │
+   ▼    ▼         ▼   phase 1   intra-node: regroup / aggregate by destination node
+  each rank of node A now owns node A's data for a few destination nodes
+   │
+   │                  phase 2   inter-node: few large messages; each NIC / rail
+   │                            sends its own share
+   ╚══════════════════════════════════════►  node B, node C, ...
+                                                  │
+                                                  ▼  phase 3   intra-node: scatter
+                                                               to the final ranks
+```
+
+跨节点字节数与直接 P2P 相同；变的是消息条数（表中所说的把 n·(h-1) 条小消息合并成更少的大消息）和同时在途的连接数。
 
 α-β 估算（`labs/ccl_sim/cost_model.py`）：
 
@@ -48,6 +83,24 @@ rank r 的发送缓冲分成 n 段，第 j 段发给 rank j；结束时 rank r �
 
 1. **不等长（All2Allv）**：每对 rank 之间的 token 数由路由决定、每步都变。等长 `ncclAlltoAll` 表达不了，需要先交换计数（一次小的 All2All 或 AllGather）、算偏移、再发数据，多一轮延迟（ai-infra-book 6.4.4 节）。
 2. **不均衡（skew）**：热点专家所在 rank 收的多、发回的也多。ai-infra-book 7.2.3 节指出，dispatch 的热点接收方就是 combine 的热点发送方，并给出分析方法：把 rank i → j 的载荷记成矩阵 V_ij，行和是发送量、列和是接收量、割集之和是跨边界量，各自除以带宽取最大值，就是这次交换的时间下界。`labs/ccl_sim` 的 `pairwise_all2allv` 测试 `test_pairwise_all2allv_uneven_blocks` 演示了"一条 50 元素的热点消息决定该轮的 `max_port_elems`"。9.4.1 节进一步说明：EP 越大，每卡平均行数下降得越快，但最忙卡下降得慢，整层按最忙的卡计时。
+
+   用 V_ij 矩阵把这个分析画出来（n = 4，假设 rank 2 上有热点专家；数字是示意用的相对单位，不是实测值）：
+
+   ```text
+   dispatch: V[i][j] = bytes from rank i to rank j
+
+                 to 0   to 1   to 2   to 3  │ send (row sum)
+     from 0       .      1      4      1    │   6
+     from 1       1      .      4      1    │   6
+     from 2       1      1      .      1    │   3
+     from 3       1      1      4      .    │   6
+     ───────────────────────────────────────┼─────
+     recv         3      3     12      3
+     (col sum)                  ▲
+                                └─ lower bound = max(all row / col sums) / B  →  rank 2 recv (12)
+
+   combine:  V' = transpose(V), so rank 2 becomes the busiest sender
+   ```
 3. **小消息、延迟敏感**：推理 decode 每个 rank 只有几到几百个 token，每条消息只有 KB 级，处在 α 主导区；pairwise 的 (n-1)·α 在 EP 大时很可观，且 dispatch/combine 每层各一次、都在关键路径上。
 4. **与计算的依赖**：combine 的数据要等专家算完才就绪；dispatch 可以和 attention 之后的计算重叠，combine 可以和下一个 micro-batch 重叠（两批交错，DeepEP 等库提供这类接口）。
 5. **数据格式不对称**：dispatch 常用 FP8（附 scale）、combine 用 BF16，回程字节约为去程的两倍（ai-infra-book 7.2.3 节）。

@@ -15,6 +15,7 @@
 | [03-sglang-communication.md](03-sglang-communication.md) | SGLang 通信层、DP attention、layer_boundary、DeepEP dispatcher、TBO、PD disaggregation | “SGLang 与 vLLM 的通信层哪里同源、哪里分叉” |
 | [04-deepep.md](04-deepep.md) | DeepEP V1 normal / low-latency 概念，与本地 V2.5（NCCL Gin）代码对照 | “MoE All2All 为什么要专用库，它和 NCCL/NVSHMEM 什么关系”（kernel 细节见 [09-ep-kernels](../09-ep-kernels/README.md)） |
 | [05-torch-distributed.md](05-torch-distributed.md) | ProcessGroup/ProcessGroupNCCL、comm 创建时机、stream/event、Work、watchdog、`TORCH_NCCL_*` | “hang 了/超时了，PyTorch 这一层发生了什么” |
+| [06-pd-af-end-to-end.md](06-pd-af-end-to-end.md) | 一次请求走完 PD 分离 + AF 分离：每层 QKV/KV cache、prefill 与 decode 的 token 用量、KV 传输、attention ⇄ FFN 的 M2N 往返 | “一个 token 从输入到输出经过哪些计算和通信，哪些要算、哪些复用” |
 
 ## 上层调用链总图
 
@@ -64,6 +65,19 @@
 2. 再读 02、03，把表里的每一行落到具体框架代码。
 3. 读 04 理解 MoE All2All 为何脱离通用 collective。
 4. 最后读 05，作为训练侧和排障时的 PyTorch 背景。
+5. 06 可以最先读：它从模型计算的角度把一次请求从头走到尾，帮你定位 01~04 讲的每种通信发生在哪一步。
+
+从 06 的一次请求出发，各步通信该去哪篇看细节：
+
+```text
+ 06 一次请求：prefill → KV 传输 → decode（可选 AF 分离）
+   ├─ 每层的 TP AllReduce、EP dispatch/combine：是什么、多大、是否关键路径 ──► 01
+   ├─ 这些 AllReduce / dispatch 在 vLLM 里走哪条代码路径 ────────────────────► 02
+   ├─ SGLang 的同一件事（DP-Attention gather/scatter、TBO 重叠）─────────────► 03
+   ├─ dispatch/combine 的专用 kernel（normal / low-latency）─────────────────► 04 → 09-ep-kernels
+   ├─ P → D 的 KV 传输（KVConnector / KVSender，走 RDMA 引擎）───────────────► 02 §7、03 §6
+   └─ 兜底的 ProcessGroupNCCL、hang 与超时排障 ──────────────────────────────► 05
+```
 
 ## 面试自测
 

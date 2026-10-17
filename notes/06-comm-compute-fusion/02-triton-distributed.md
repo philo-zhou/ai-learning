@@ -61,6 +61,20 @@ GEMM 侧（消费者 kernel）: 每个 tile 开始前 dl.wait(signal[所需分�
 
 调度上，GEMM 侧按"本地分片优先、其他 rank 按到达顺序"重排 tile（`swizzle`），这样前几个 tile 无需等待。
 
+下图把 AG+GEMM 的生产者、对称内存里的数据与信号、消费者 GEMM 之间的读写关系画在一起（名称取自 `allgather_gemm.py` 的 context 与 kernel）。
+
+```text
+comm stream                               symmetric memory                  main stream
+┌───────────────────────────┐          ┌─────────────────────┐          ┌──────────────────────────┐
+│ cp_engine_producer_       │          │ AG buffer           │          │ kernel_consumer_gemm_*   │
+│ all_gather_*              │──data───►│ (symm_workspaces)   │◄──load───│ per tile:                │
+│ copy engine / NVSHMEM     │          │ ready flags         │          │ dl.wait + consume_token  │
+│                           │──signal─►│ (symm_barriers)     │◄──wait───│ then TMA load, tl.dot    │
+└───────────────────────────┘          └─────────────────────┘          └──────────────────────────┘
+```
+
+两条 stream 在 `rowise_ag_gemm_dispatcher` 里先 `wait_stream(current_stream)` 再各自启动，末尾 `current_stream.wait_stream(...)` 合流（见下面源码导读）。
+
 ## 源码导读（路径 + 函数 + 作用）
 
 ### AllGather + GEMM
@@ -81,8 +95,51 @@ GEMM 侧（消费者 kernel）: 每个 tile 开始前 dl.wait(signal[所需分�
 
 - `GEMMReduceScatterTensorParallelContext`、`create_gemm_rs_context`：含 `rs_stream`、`num_gemm_sms = NUM_SMS - rs_ctx.num_rs_sms`。
 - `kernel_gemm_rs_producer_persistent`：GEMM 是"生产者"。每个 tile 完成并写出后，对覆盖到的每个 rank 行段递增原子计数器（`tl.atomic_add(..., sem="release", scope="gpu")`）；当某行段的所有 tile 都完成（计数达到 `tiled_m_size * num_pid_n`），调用 `dl.notify(barrier_ptr + counter_id, rank, signal=1, comm_scope="gpu")`。`FUSE_SCATTER` 分支则直接用 `dl.symm_at(c_ptr, cur_rank)` 把结果 `tl.store` 到对应 rank 的缓冲。
+
+下图是上面 `kernel_gemm_rs_producer_persistent` 的信号判定流程：只有让某个行段计数达到 `tiled_m_size * num_pid_n` 的那个 tile 才发 `notify`。
+
+```text
+┌────────────────────────────────────┐
+│ GEMM tile (m, n) done and stored   │  ← producer: GEMM
+└──────────────────┬─────────────────┘
+                   ▼
+┌────────────────────────────────────┐
+│ atomic_add(counter[segment],       │  ← 对覆盖到的每个 rank 行段递增
+│   sem=release, scope=gpu)          │
+└──────────────────┬─────────────────┘
+                   ▼
+┌────────────────────────────────────┐
+│ dl.notify(barrier_ptr + counter_id,│  ← 仅当该行段计数达到 tiled_m_size * num_pid_n
+│   rank, signal=1)                  │
+└──────────────────┬─────────────────┘
+                   ▼
+┌────────────────────────────────────┐
+│ reduce-scatter side sees signal,   │  ← 归约侧开始处理这个行段
+│ reduces this row segment           │
+└────────────────────────────────────┘
+```
+
 - `kernel_gemm_rs_producer_persistent_reduce_st`、`kernel_gemm_rs_producer_non_persistent`：另两种变体。
 - `gemm_rs_op`（主入口）：先在主 stream 上启动 GEMM 生产者 kernel；`fuse_scatter=False` 时在 `rs_stream` 上调用 `reduce_scatter_2d_op(gemm_out, ctx.rs_ctx, output)` 做归约，再让主 stream `wait_stream(rs_stream)`；`fuse_scatter=True` 时 GEMM 已把结果写到各 rank，之后用 `nvshmem_barrier_all_on_stream` 夹住 `ring_reduce` 本地归约。reduce-scatter 的各种实现在 `reduce_scatter.py`（如 `reduce_scatter_ring_push_1d_intra_node_ce` 走 copy engine、`..._sm` 走 SM；`num_rs_sms` 属性决定通信占 SM 数）。
+
+下图对比 `gemm_rs_op` 两种分支的 stream 与归约安排：`fuse_scatter=False` 在 `rs_stream` 上做归约，`fuse_scatter=True` 由 GEMM 直接写到各 rank 再本地归约。
+
+```text
+fuse_scatter=False
+             ┌───────────────────┐       ┌─────────────┐
+main stream  │ GEMM producer     │──────►│ wait_stream │
+             └───────────────────┘       └──────┬──────┘
+rs_stream           ┌─────────────────────────┐ │
+                    │ reduce_scatter_2d_op    ├─┘
+                    └─────────────────────────┘
+
+fuse_scatter=True  (GEMM 之后，用 barrier 夹住 ring_reduce)
+┌─────────────────────────┐   ┌─────────────────────┐   ┌────────────────┐   ┌─────────────────────┐
+│ GEMM producer:          │   │ nvshmem_barrier_all │   │ ring_reduce    │   │ nvshmem_barrier_all │
+│ store to symm_at(c_ptr) │──►│ _on_stream          │──►│ (local reduce) │──►│ _on_stream          │
+└─────────────────────────┘   └─────────────────────┘   └────────────────┘   └─────────────────────┘
+```
+
 - `gemm_rs` 带 autotune，`get_gemm_rs_config_space` 给出搜索空间。
 
 ### MoE 与 EP all2all

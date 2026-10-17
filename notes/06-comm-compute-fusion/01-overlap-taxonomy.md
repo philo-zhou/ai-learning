@@ -24,6 +24,44 @@
 | D. copy-engine 卸载 | 分片 | 主机或 CE | Triton-distributed AllGather 的 cp_engine 路径、DeepEP bucket all-gather（`num_sms=0`） | 只适合搬运不适合归约；有 CE 调度延迟 |
 | E. SM 数权衡 | 横切 | — | DeepEP `num_sms`、Triton-distributed 的 GEMM SM 数 = 总 SM − 通信 SM | 通信越快、计算越慢，要联合调 |
 
+下图把前三层的时间线放在一起对比：串行、A 层 stream 级重叠、B 层 tile 级流水、C 层 kernel 内融合（块数 4 只是示意）。
+
+```text
+time ───────────────────────────────────────────────────────►
+
+(1) 串行：同一 stream 上先通信、后计算
+comm     ┌────────────────┐
+         │ AllGather      │
+         └────────────────┘
+gemm                      ┌────────────────┐
+                          │ GEMM           │
+                          └────────────────┘
+
+(2) A. stream 级：整个集合通信放到另一条 stream，与无依赖的计算同时跑
+comp     ┌────────────┐┌────────────┐
+         │ comp #1    ││ comp #2    │
+         └────────────┘└────────────┘
+comm                   ┌────────────┐
+                       │ comm #1    │   ← 通信在另一条 stream，与 comp #2 并行
+                       └────────────┘
+
+(3) B. tile 级流水：第 k 块到了就先算第 k 块
+comm     ┌──────┐┌──────┐┌──────┐┌──────┐
+         │ c0   ││ c1   ││ c2   ││ c3   │
+         └──────┘└──────┘└──────┘└──────┘
+comp             ┌──────┐┌──────┐┌──────┐┌──────┐
+                 │ t0   ││ t1   ││ t2   ││ t3   │   ← 首块填充、末块收尾仍暴露
+                 └──────┘└──────┘└──────┘└──────┘
+
+(4) C. kernel 内融合：一个 kernel 内，算完一块线程直接 put / signal
+SM-comp  ┌──────┐┌──────┐┌──────┐┌──────┐
+         │ t0   ││ t1   ││ t2   ││ t3   │
+         └──────┘└──────┘└──────┘└──────┘
+SM-comm          ┌──────┐┌──────┐┌──────┐┌──────┐
+                 │ p0   ││ p1   ││ p2   ││ p3   │   ← 无主机往返，但要划出 SM
+                 └──────┘└──────┘└──────┘└──────┘
+```
+
 ### A. stream 级 overlap
 
 - **DDP 梯度分桶**：反向逐层产生梯度，多个梯度合并成一个桶，桶内梯度都算完才发起 AllReduce。书中第 10.3.3 节：桶越大越可能等最后一个梯度，桶越小启动次数越多。另外，先算 $dX$ 让前一层更早反向，先算 $dW$ 则本层梯度通信更早启动，计算顺序本身也是调度变量。
@@ -36,6 +74,19 @@
 
 - 思路：把"先 AllGather 整个输入再做 GEMM"改成"哪一块到了就先算哪一块"。
 - **AllGather + GEMM**：每个 rank 持有 `[M/world, K]` 的输入分片，GEMM 需要完整的 `[M, K]`。拆成：通信侧按 rank 分片收集并置位"该分片就绪"信号；GEMM 侧每个 tile 在加载 A 之前等待它所覆盖的分片信号。本地分片不需要等，所以 tile 调度会让每个 rank 先算自己已有的分片（swizzle）。实际代码见 02 文档对 `kernel_consumer_gemm_persistent` 的导读。
+
+下图示意 AllGather+GEMM 的依赖信号与 swizzle：本 rank 先算本地分片，其余分片的 tile 在对应 ready 信号置位后才加载 A（world=4、本 rank=1、分片到达顺序均为示意）。
+
+```text
+comm    ┌─────┐┌─────┐┌─────┐
+        │ S2  ││ S3  ││ S0  │   ← 通信侧：每个分片到齐就置 ready[Sk]
+        └─────┘└─────┘└─────┘
+gemm    ┌─────┐┌─────┐┌─────┐┌─────┐
+        │ S1  ││ S2  ││ S3  ││ S0  │   ← GEMM 侧：覆盖该分片的 tile
+        └─────┘└─────┘└─────┘└─────┘
+        (local)   ▲ 加载 A 之前 wait ready[S2]；本地分片 S1 不用等
+```
+
 - **GEMM + ReduceScatter**：反过来，GEMM 一个 tile 算完，就按其所在行段通知归约侧可以开始。Triton-distributed 中用原子计数器统计某个 rank 对应的 tile 是否全部完成，完成后再 `notify`（见 02）。
 - **MoE 两阶段流水**：dispatch → 专家计算 → combine，拆成两个 micro-batch，第一批计算时第二批 dispatch。书中第 9.4.3 节：理想值 0.827 ms → 0.581 ms，但若 DMA 与 GEMM 争 HBM 使通信各慢 49%，收益归零。
 - 局限：拆分带来额外的启动次数与同步；Triton-distributed 的 E2E 文档（`third_party/Triton-distributed/docs/getting-started/e2e/e2e_dense.md`）明确写到，Attention 部分 shape 太小时 AG+RS 拆分反而比单个 AllReduce 慢（speedup 0.961、0.985），此时应改用 GEMM+AllReduce。
@@ -45,6 +96,22 @@
 
 - 传统 host-initiated：GPU 算完 → CPU 轮询或事件 → CPU 提交通信 → GPU 再继续。书中第 6.4.4 节：CPU 代理线程路径控制信号要穿越 PCIe 三次；GPU SM 发起则两次；NIC 上处理器则为零。
 - device-initiated：kernel 里的线程直接 put/get/signal 到对端 symmetric memory。好处是"数据一算完就能发"，并省掉主机往返（书中第 7.3.2 节）；代价是要划出一部分 SM 构造请求、轮询完成。
+
+下图对比两种发起方式的控制路径：host-initiated 每次都要回到 CPU，device-initiated 由 kernel 内线程直接发起。
+
+```text
+host-initiated
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│ GPU compute │────►│ CPU poll or │────►│ CPU submits │────►│ GPU resumes │
+│ kernel done │     │ event wait  │     │ comm        │     │ next kernel │
+└─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
+
+device-initiated
+┌───────────────┐     ┌─────────────────────┐     ┌──────────────────┐
+│ tile k done   │────►│ thread put / signal │────►│ compute tile k+1 │   ← put 写入对端 symmetric memory，不回到主机
+└───────────────┘     └─────────────────────┘     └──────────────────┘
+```
+
 - 例子：
   - `third_party/DeepEP/csrc/kernels/ep/dispatch.hpp` 与 `third_party/DeepEP/deep_ep/include/deep_ep/impls/ep/hybrid_dispatch.cuh`（kernel 内 `gin.put`，注释里写 "Issue IBGDA requests"）。
   - NCCL device API 示例 `third_party/nccl/docs/examples/07_kernel_fusion/README.md`：RMSNorm 与 reduce-scatter、all-gather 融合，用 LSA（NVLink 域内直接指针访问）、GIN（GPU-initiated networking）或混合模式。该 README 自述示例不以性能为目标。

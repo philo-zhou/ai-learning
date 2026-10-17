@@ -20,6 +20,22 @@ ai-infra-book 不是一本"NCCL 教程"，它用 α-β 时间模型 + 物理路�
 
 ## 建议阅读顺序（按优先级排列）
 
+三轮阅读与书中章节、notes 目录的对应关系（只列每轮的主要章节；书没覆盖的 NCCL 实现细节在最后一节从源码补）：
+
+```text
+             书中章节（manuscripts/）                       主要落到的 notes 目录
+第一轮 ─┬─ 04 §4.5.3 点对点 T = α + V/R ──────────────────► 03-ccl-algorithms
+ (必读) ├─ 06 §6.2 / §6.4 并行方式、环与树、库与资源竞争 ─► 03 / 04 / 05 / 06 / 07
+        └─ 07 §7.1~§7.6 跨服务器流量、RDMA、拥塞 ─────────► 01-rdma / 03 / 07
+第二轮 ─┬─ 06 §6.5 拓扑与超节点 ──────────────────────────► 02-scale-up / 03
+(细节)  ├─ 07 §7.1.3 / §7.2.3 / §7.4 QP 状态、EP 负载 ────► 01-rdma / 05
+        └─ 04 §4.4.4 / §4.5.2 fence 交接、CPU↔GPU ────────► 06-comm-compute-fusion
+第三轮 ─┬─ 05 §5.1.3 / §5.5 stream、CUDA Graph ───────────► 04 / 06
+(场景)  ├─ 09 §9.2.2 / §9.4 KV 传输、大 EP 流水 ──────────► 05 / 06
+        └─ 10 / 11 训练系统、调度 ────────────────────────► 05 / 07
+书未覆盖 ── NCCL 初始化 / channel / 协议 / proxy ─────────► 04-nccl-internals（读 third_party/nccl）
+```
+
 ### 第一轮：必读主线（约 2 周）
 
 | 顺序 | 章节路径 | 讲了什么 | 对应 JD | 对应 notes 目录 |
@@ -87,7 +103,7 @@ ai-infra-book 不是一本"NCCL 教程"，它用 α-β 时间模型 + 物理路�
 | MoE EP 通信 | `third_party/DeepEP/deep_ep/buffers/ep.py`、`csrc/kernels/ep/` | [05-framework-integration](../05-framework-integration/README.md) |
 | 推理框架通信层 | `third_party/vllm/vllm/distributed/device_communicators/`、`third_party/sglang/python/sglang/srt/distributed/device_communicators/` | [05-framework-integration](../05-framework-integration/README.md) |
 
-- Halving-Doubling（Rabenseifner）：书中只在 §6.5.1 以"递归算法每轮把对端距离翻倍"的形式出现，没有完整推导。待确认：NCCL 中是否有对应实现（`src/tuning/` 下有 `ring.cc`、`tree.cc`、`pat.cc`、`nvls.cc`、`collnet.cc`）；确认方式：阅读 `third_party/nccl/src/tuning/pat.cc` 与 `src/device/` 中 PAT 相关代码。
+- Halving-Doubling（Rabenseifner）：书中只在 §6.5.1 以"递归算法每轮把对端距离翻倍"的形式出现，没有完整推导。本地源码核实：算法编号只有 Tree/Ring/CollNetDirect/CollNetChain/NVLS/NVLSTree/PAT 七种（`third_party/nccl/src/include/plugin/nccl_tuner.h` 的 `NCCL_ALGO_*`，`src/init.cc` 的 `ncclAlgoStr`），`src/config/algorithm_registry.cc` 的 `algRegistry[]` 中也没有 halving/doubling 条目，`grep -riE 'halving|doubling' third_party/nccl/src` 无匹配，所以 NCCL 没有独立的 Halving-Doubling（Rabenseifner）AllReduce；最接近的是 PAT——仅 AllGather/ReduceScatter、仅 Simple，`src/include/collectives.h` 的 `PatRSAlgorithm`/`PatAGAlgorithm` 按 2 的幂维度（`nrPow2`、`firstBitSet`）选对端，是对数步算法。
 - PyTorch 未克隆到 `third_party/`，`ProcessGroupNCCL` 相关内容需另行确认。
 
 ## 待深入

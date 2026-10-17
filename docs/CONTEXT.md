@@ -34,6 +34,12 @@
 - 避免：等同于"机内/机间"——NVL72 这类超节点的 scale-up 域可以跨多台机箱。
 - 相关代码或契约：`notes/02-scale-up/README.md`、`notes/01-rdma/README.md`
 
+### PFC / ECN / CNP / ETS（RoCE QoS）
+
+- 定义：PFC 是按优先级（8 个之一）逐跳暂停的链路流控，暂停帧是 MAC 控制帧；ECN 是交换机在队列超阈值时给报文打的拥塞标记；CNP 是接收网卡看到 ECN 标记后回给发送方的拥塞通知包，触发 DCQCN 降速；ETS 是在各优先级之间按权重分配带宽的调度方式（与严格优先 strict 相对）。
+- 避免：把 PFC 当成一种"更高优先级的流量"——它是作用在某个优先级上的暂停开关；把 RoCE 设成严格优先（会饿死 TCP）。
+- 相关代码或契约：`notes/01-rdma/03-roce-ib-congestion.md`、`docs/references/2026-10-17-roce-qos-config.md`
+
 ### QP（Queue Pair）
 
 - 定义：RDMA Verbs 的通信端点，由发送队列与接收队列组成，需经 RESET→INIT→RTR→RTS 状态转换才能收发。

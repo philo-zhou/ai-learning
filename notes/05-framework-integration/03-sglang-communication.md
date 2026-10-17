@@ -78,6 +78,32 @@ PD 分离：disaggregation/prefill.py ↔ decode.py ── KVSender/KVReceiver �
 - scatter：`dp_scatter` 本地切回自己那段；`dp_reduce_scatter_tensor`（`SGLANG_DP_USE_REDUCE_SCATTER`）以 ReduceScatter 合并“求和 + 分发”。
 - TBO 异步版：`dp_gather_partial_async`、`dp_reduce_scatterv_async`、`get_dp_tbo_comm_stream`（独立通信 stream）。
 
+以 attn_dp=4、attn_tp=1、未开 attention CP 为例，一层 MLP/MoE 前后的 token 搬运（n_i 是 rank i 本步的 token 数）：
+
+```text
+ attention（每个 rank 只处理自己的请求和 KV）
+   rank0: n0 rows    rank1: n1 rows    rank2: n2 rows    rank3: n3 rows
+                       │
+                       │ dp_gather_partial / dp_gather_replicate → _dp_gather，三选一
+                       ▼
+ global buffer（每个 rank 一份；按 rank 顺序分槽，local_start_pos 定位本 rank 的槽）
+   ┌──────────┬──────┬──────────────┬────┐
+   │ n0       │ n1   │ n2           │ n3 │
+   └──────────┴──────┴──────────────┴────┘
+   _dp_gather_via_all_reduce  : fill_(0) → 只写本 rank 的槽 → AllReduce(SUM)
+                                （attn_cp_size > 1 时固定走这条）
+   _dp_gather_via_all_gather  : MAX_LEN 模式，每槽补齐到同一长度 → all_gather_into_tensor
+   _dp_gather_via_all_gatherv : 变长 AllGatherV，恰好 Σ n_i 行（SGLANG_DP_USE_GATHERV）
+                       │
+                       ▼
+ MLP / MoE 在全部 token 上计算
+                       │
+                       ▼
+ 回程二选一：
+   dp_scatter               : 按 local_start_pos 把本 rank 的槽 memcpy 回本地（纯本地拷贝）
+   dp_reduce_scatter_tensor : ReduceScatter 一次完成"求和 + 只拿回本 rank 那段"
+```
+
 ### 4. 层边界通信编排：`third_party/sglang/python/sglang/srt/layers/layer_boundary/`
 
 包注释：“Stage boundaries: layout transport, residual updates, reads, and fusion.” 早期的 `layers/communicator.py`（`LayerCommunicator`）在本 commit 不存在，职能迁到这里。
@@ -99,6 +125,25 @@ PD 分离：disaggregation/prefill.py ↔ decode.py ── KVSender/KVReceiver �
   - `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK`（默认 128）决定 LL buffer 容量。
 - 其他 dispatcher：`deepep_v2.py`、`mooncake.py`、`nixl.py`、`moriep.py`、`pplx.py`、`flashinfer.py`。
 - 重叠：`third_party/sglang/python/sglang/srt/batch_overlap/two_batch_overlap.py`（`TboForwardBatchPreparer`、`MaybeTboDeepEPDispatcher`、`model_forward_stages`）、`operations.py`（`execute_overlapped_operations`、`YieldOperation`）、`single_batch_overlap.py`。CLI `--enable-two-batch-overlap`、`--enable-single-batch-overlap`。
+
+TBO 怎样把 A2A 藏起来：`third_party/sglang/python/sglang/srt/batch_overlap/operations_strategy.py` 的 `_compute_moe_deepseek_blog_prefill` 用 `YieldOperation` 把一层 DeepSeek MoE 切成 3 个 stage（`tbo_delta_stages=0`），`execute_overlapped_operations` 每步依次推进 A、B 两个 micro-batch 各一个 stage：
+
+```text
+ stage 1: comm_prepare_attn → attn prepare/core → comm_prepare_mlp → gate → select_experts → dispatch_a
+ stage 2: dispatch_b → experts → combine_a
+ stage 3: shared_experts → combine_b → output → postprocess_layer → (下一层的 stage 1 ...)
+
+ stage           1         2         3         4         5         6
+ issue          A.s1      B.s1      A.s2      B.s2      A.s3      B.s3
+            ┌─────────┬─────────┬─────────┬─────────┬─────────┬─────────┐
+ compute    │  A attn │  B attn │A experts│B experts│ A shared│ B shared│
+ comm A     │         │═A disp═►│         │═A comb═►│         │         │
+ comm B     │         │         │═B disp═►│         │═B comb═►│         │
+            └─────────┴─────────┴─────────┴─────────┴─────────┴─────────┘
+   *_a 发起通信后 Yield，换另一个 micro-batch 计算；下一次轮到自己时 *_b 等待结果
+```
+
+DeepEP normal 的通信 kernel 自己占 SM，所以这个策略把 DeepGEMM 可用的 SM 设为 `总 SM − DeepEPConfig.num_sms`（`deep_gemm_num_sms`）。decode 用 `_compute_moe_deepseek_blog_decode`：切得更细（5 个 `YieldOperation`），`tbo_delta_stages=2`，即 B 比 A 晚 2 个 stage 起步。
 - EPLB：`third_party/sglang/python/sglang/srt/eplb/`（`EPLBManager`、`expert_distribution.py` 统计各专家负载）。
 
 ### 6. PD 分离：`third_party/sglang/python/sglang/srt/disaggregation/`

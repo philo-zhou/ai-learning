@@ -13,6 +13,21 @@ NCCL 的环境变量几乎都在源码里通过 `NCCL_PARAM(Name, "KEY", default
 - 查看全部参数：`ncclparam -l`（`src/param/ncclparam.cc`），`-a` 含私有参数（等价设置 `NCCL_PARAM_DUMP_ALL`）。
 - 本笔记被 [02-perf-methodology.md](02-perf-methodology.md)、[03-troubleshooting.md](03-troubleshooting.md) 引用。
 
+一个值从哪里来、何时定住（`src/misc/param.cc` 的 `initEnvFunc`/`setEnvFile`/`ncclLoadParam`，`src/os/linux.cc::ncclOsSetEnv`）。配置文件经 `setenv(name, value, 0)` 写入，**不覆盖已存在的变量**，所以优先级是：进程环境 > 用户配置文件 > `/etc/nccl.conf`。
+
+```text
+  1. process env (export / launcher)          ── always wins
+  2. NCCL_CONF_FILE, else ~/.nccl.conf        ── read first, fills unset keys only
+  3. /etc/nccl.conf                           ── read last,  fills unset keys only
+                    │  (initEnvFunc runs once, std::call_once)
+                    ▼
+  ncclGetEnv(name) ──► env plugin: ncclEnvPluginGetEnv   (default plugin = std::getenv)
+                    │
+                    ▼
+  ncclParamXxx()  ──► ncclLoadParam: first call parses and caches the value
+                      later calls return the cache  (NCCL_NO_CACHE: per-key opt-out)
+```
+
 ## 核心概念
 
 - 缓存语义：`NCCL_PARAM` 生成的 `ncclParamXxx()` 第一次调用时读取并缓存（`static int64_t cache`），之后在进程内不再变化；`NCCL_NO_CACHE`（`src/param/param.cc:20`）可对指定 key 关闭缓存。结论：环境变量要在第一次调用 NCCL 之前设好。
@@ -22,6 +37,29 @@ NCCL 的环境变量几乎都在源码里通过 `NCCL_PARAM(Name, "KEY", default
 ## 源码导读：变量速查表
 
 路径均相对 `third_party/nccl/src/`。
+
+下表按主题分成 8 节；先用一张图看每节变量作用在 NCCL 的哪一层（sec 列为本文小节号）：
+
+```text
+  layer                         typical variables                                    sec
+  ─────────────────────────     ─────────────────────────────────────────────────    ───
+  comm config / misc            NCCL_CONF_FILE, COMM_BLOCKING, CHECK_POINTERS        7
+        │
+  algo / proto / channel        ALGO, PROTO, MIN/MAX_NCHANNELS, *_CTAS, BUFFSIZE     2
+  selection (tuning)            TUNER_PLUGIN, NTHREADS, P2P_*_CHUNKSIZE
+        │
+  topology and graph            TOPO_FILE, TOPO_DUMP_FILE, GRAPH_FILE                6
+        │
+        ├── scale-up transport  P2P_LEVEL/DISABLE, SHM_*, NVLS_*, CUMEM_*, MNNVL_*   3
+        │
+        └── scale-out transport NET, NET_PLUGIN, NET_GDR_*, PXN_DISABLE, CROSS_NIC   4
+              │                 bootstrap: SOCKET_IFNAME, COMM_ID, SOCKET_RETRY_*    4
+              └── IB / RoCE     IB_HCA, IB_GID_INDEX, IB_TC/SL, IB_TIMEOUT, IB_QPS_* 5
+
+  cross-cutting: debug / log (DEBUG, DEBUG_SUBSYS, DEBUG_FILE)                       1
+                 RAS / diagnostics / profiler (RAS_*, RUN_DIAGNOSTICS, PROFILER_*)   7
+  (names above omit the NCCL_ prefix)
+```
 
 ### 1. 调试与日志
 

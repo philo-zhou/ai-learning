@@ -35,6 +35,28 @@ struct testColl {
 
 每个 `*.cu` 定义自己的 `struct testEngine ncclTestEngine`（如 `all_reduce.cu:580`），`common.cu::main` → `run()` → `threadRunTests` → `TimeTest` → `BenchTime`。
 
+展开这条调用链（`threadRunTests` 与 `TimeTest` 之间隔着各集合自己的 `runTest`，如 `AllReduceRunTest` 先设置 `args->collTest = &allReduceTest`），可以看到 4 个回调各在哪一步被调用：
+
+```text
+ common.cu::main → run()
+  └ threads[t].func = threadRunTests            one per -t thread
+     └ ncclTestEngine.runTest                   e.g. AllReduceRunTest (all_reduce.cu)
+        ├ args->collTest = &allReduceTest
+        └ TimeTest                              per (type, op)
+           └ for size in -b .. -e  (x -f, or + -i)
+              ├ setupArgs ──► collTest->getCollByteCount     ← 算每 rank 元素数
+              ├ BenchTime(in_place = 0)                      ← out-of-place 列
+              └ BenchTime(in_place = 1)                      ← in-place 列
+
+ BenchTime
+  ├ warmup : startColl x -w ──► collTest->runColl, then completeColl
+  ├ timed  : -n iters x -m agg_iters   (ncclGroupStart/End when -m > 1;
+  │                                     -G: capture once, cudaGraphLaunch x -G)
+  ├ deltaSec = elapsed / (iters x agg_iters) ──► Allreduce over ranks (-a)
+  ├ collTest->getBw(count, typesize, deltaSec, &algBw, &busBw, nranks)
+  └ -c checks: collTest->initData → startColl → completeColl → CheckData ──► #wrong
+```
+
 ### algbw / busbw 计算位置
 
 | 集合 | 函数（文件） | algbw | busbw 因子 |
@@ -51,6 +73,19 @@ struct testColl {
 单位：GB/s，按 1e9 计（不是 GiB）。调用点：`common.cu::BenchTime` 中 `args->collTest->getBw(count, wordSize(type), deltaSec, &algBw, &busBw, args->nProcs*args->nThreads*args->nGpus)`。
 
 推导（`doc/PERFORMANCE.md`）：AllReduce 每个元素要做 n-1 次加法和 n 次赋值，最少 `2(n-1)` 次传输，分摊到 n 条每条带宽 B 的链路，`t = (S/B) * 2(n-1)/n`，所以 `B = algbw * 2(n-1)/n`。文档强调这与具体用 ring 还是 tree 无关（只要是点对点 send/recv 实现）。ai-infra-book 6.4.3 给出实例：两台 HGX H100 共 16 rank、64 MiB AllReduce 466.1 us，algbw 143.99 GB/s，busbw 为其 1.875 倍（= 2×15/16）即 269.98 GB/s，并提醒 busbw 是归一化指标，不能直接当作每张网卡的实际吞吐（分层、交换机内归约会改变实际流量）。
+
+把上面的推导和书中实例摆成一条换算线（数字均来自上文，未在本机运行）：
+
+```text
+ user view                              per-link view (n ranks, n links of bandwidth B)
+ ─────────                              ───────────────────────────────────────────────
+ S bytes all-reduced in time t          each link carries >= S x 2(n-1)/n
+ algbw = S / t           ──── x 2(n-1)/n ────►   busbw = algbw x 2(n-1)/n
+
+ example: n = 16, S = 64 MiB = 67,108,864 B, t = 466.1 us
+   algbw = 67,108,864 / 1e9 / 466.1e-6   ≈ 144.0 GB/s    ← 书中给出 143.99
+   busbw = algbw x (2 x 15 / 16)         = algbw x 1.875 ≈ 270.0 GB/s   ← 书中给出 269.98
+```
 
 ### 计时方式（`common.cu::BenchTime`）
 

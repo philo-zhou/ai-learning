@@ -1,6 +1,6 @@
 # 从这里开始：从大模型推理出发，看懂并行、通信与 EP
 
-> 层次：总览（贯穿上中下三层） · 来源：[调研报告](../../docs/references/2026-10-14-inference-parallelism-ep-research.md)（2026-10-14，外部来源编号记为 S1~S17）、third_party/ai-infra-book@3bdcb4fc（§6、§7.2.3、§9.4）、third_party/nccl@3e46c089、third_party/vllm@02653fa2、third_party/sglang@d2a43644、third_party/DeepEP@93eb6eb2
+> 层次：总览（贯穿上中下三层） · 来源：[调研报告](../../docs/references/2026-10-14-inference-parallelism-ep-research.md)（2026-10-14，外部来源编号记为 S1~S17）、third_party/ai-infra-book@3bdcb4fc（§6、§7.2.3、§9.4）、third_party/nccl@3e46c089、third_party/vllm@02653fa2、third_party/sglang@d2a43644、third_party/DeepEP@93eb6eb2、third_party/DeepEP-hybrid-ep@10d4dd73
 
 ## 一句话
 
@@ -88,6 +88,27 @@ $$V \approx 2\,n\,k\,f\,d$$
 4. **通信与数据重排融合**：dispatch 要把 token 按专家重排给 grouped GEMM，combine 要做加权求和。这些逻辑和通信融合在同一个 kernel 里，通用 AllReduce 没有这一层。
 5. **SM 争用**：通信 kernel 会占用 SM。占得越少，留给计算的越多，这直接影响通算重叠的效果。
 
+下图把第 2、3 点并排对比：HT 先知道"各发多少"再传，LL 用固定容量缓冲省掉计数交换这一步。
+
+```text
+ HT / normal (prefill)                      LL (decode)
+┌─────────────────────────────┐            ┌─────────────────────────────┐
+│ 1. exchange layout (counts) │            │ 1. pre-allocated fixed      │
+│                             │            │    buffer, max capacity     │
+└──────────────┬──────────────┘            └──────────────┬──────────────┘
+               ▼                                          ▼
+┌─────────────────────────────┐            ┌─────────────────────────────┐
+│ 2. send data,               │            │ 2. direct point-to-point,   │
+│    contiguous layout        │            │    masked layout            │
+└──────────────┬──────────────┘            └──────────────┬──────────────┘
+               ▼                                          ▼
+┌─────────────────────────────┐            ┌─────────────────────────────┐
+│ 3. hierarchical:            │            │ 3. static shapes            │
+│    NVLink intra -> RDMA     │            │    -> CUDA Graph friendly   │
+└─────────────────────────────┘            └─────────────────────────────┘
+   追求带宽                                    追求延迟
+```
+
 ### 3.4 怎么把 EP 通信藏起来
 
 - **Prefill**：双 micro-batch 重叠，一个 micro-batch 的通信藏在另一个的计算后面 [F5]。实现：SGLang `third_party/sglang/python/sglang/srt/batch_overlap/two_batch_overlap.py`，vLLM DBO `third_party/vllm/vllm/v1/worker/ubatching.py` [G6]。
@@ -95,11 +116,42 @@ $$V \approx 2\,n\,k\,f\,d$$
 - **更进一步**：attention 与 FFN 分离部署（MegaScale-Infer），用 ping-pong 流水在两组 GPU 之间来回传 micro-batch，中间走 M2N 通信 [F13]。
 - **kernel 级**：LL 模式的"只发送 + 稍后完成"接口（NCCL EP 的 `send_only` + `ncclEpComplete` [F11]；DeepEP V1 的 recv hook），把等待推迟到计算之后。
 
+以 prefill 的双 micro-batch 重叠为例，示意时间线如下（只表达先后与重叠关系，宽度不代表真实耗时）：
+
+```text
+t ─────────────────────────────────────────────────►
+
+single batch
+  compute: [ attn ]          [expert]
+  comm   :         [dispatch]        [combine ]
+                    ▲ 计算空等         ▲ 计算空等
+
+two micro-batches (0 / 1)
+  compute: [attn0][attn1][exp0 ][exp1 ]
+  comm   :        [disp0][disp1][comb0][comb1]
+                  └─ mb0 的通信与 mb1 的计算同时进行
+```
+
 深入：[DeepEP](../05-framework-integration/04-deepep.md)、[All2All 算法与 MoE 特殊性](../03-ccl-algorithms/04-all2all.md)、[通算重叠分类](../06-comm-compute-fusion/01-overlap-taxonomy.md)；动手：`labs/ccl_sim` 的 `pairwise_all2allv` 可以模拟热点专家。
 
 ## 4. 主流 EP 通信方案全景
 
 用三个问题给方案分类：**谁发起通信**（host / GPU）、**谁驱动网卡**（GPU 直接写网卡门铃 / CPU proxy 代发 verbs）、**数据走哪**（NVLink / RDMA / 分层）。
+
+先用前两个问题把下表的主要方案挂成一棵树（第三个问题见表中"节点内"列）：
+
+```text
+谁发起通信？
+├─ host ─► NCCL ncclAlltoAll / AG+RS ─────── 网卡由 NCCL proxy 线程驱动
+└─ GPU ──► 跨节点谁驱动网卡？
+           ├─ GPU 直接写网卡门铃
+           │    ├─ DeepEP V1 ................ NVSHMEM + IBGDA
+           │    └─ Hybrid-EP ................ DOCA GPUNetIO（或 NIXL）
+           ├─ NCCL GIN，两个后端可选（GDAKI 直驱 / Proxy 代发）
+           │    └─ DeepEP V2.x、NCCL EP
+           └─ CPU proxy 线程调用 libibverbs
+                └─ UCCL-EP .................. 每通道一个 QP，跨厂商网卡
+```
 
 | 方案 | 发起方 | 跨节点如何驱动网卡 | 节点内 | 定位与要点 | 证据 |
 |---|---|---|---|---|---|
@@ -145,7 +197,7 @@ $$V \approx 2\,n\,k\,f\,d$$
 
 | 主线问题 | 落到哪一章 | 关键笔记 |
 |---|---|---|
-| 推理里哪些地方要通信、传多少？ | 上层 [05-framework-integration](../05-framework-integration/README.md) | [01-parallelism](../05-framework-integration/01-parallelism-and-comm-patterns.md)、[02-vllm](../05-framework-integration/02-vllm-communication.md)、[03-sglang](../05-framework-integration/03-sglang-communication.md) |
+| 推理里哪些地方要通信、传多少？ | 上层 [05-framework-integration](../05-framework-integration/README.md) | [01-parallelism](../05-framework-integration/01-parallelism-and-comm-patterns.md)、[02-vllm](../05-framework-integration/02-vllm-communication.md)、[03-sglang](../05-framework-integration/03-sglang-communication.md)、[06-PD+AF 全流程](../05-framework-integration/06-pd-af-end-to-end.md) |
 | 这些通信用什么算法最快？ | 中层 [03-ccl-algorithms](../03-ccl-algorithms/README.md) | [α-β 模型](../03-ccl-algorithms/02-alpha-beta-model.md)、[All2All](../03-ccl-algorithms/04-all2all.md)、`labs/ccl_sim` |
 | NCCL 怎么把算法落到硬件？ | 中层 [04-nccl-internals](../04-nccl-internals/README.md) | channel / 协议 / proxy / net plugin |
 | EP 专用库为什么存在、往哪走？ | 上层与跨层 [05](../05-framework-integration/04-deepep.md)、[06](../06-comm-compute-fusion/03-nvshmem-and-device-initiated.md) | DeepEP、NCCL EP、GIN |

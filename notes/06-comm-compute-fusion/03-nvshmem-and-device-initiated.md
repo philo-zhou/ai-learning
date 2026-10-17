@@ -28,6 +28,20 @@ RDMA NIC（见 ../01-rdma/README.md）
 
 - **PGAS（Partitioned Global Address Space）**：每个 PE（processing element，通常对应一张 GPU / 一个 rank）有自己的一块内存，所有 PE 都能按"PE 编号 + 对称地址"访问别人的那块。
 - **对称堆（symmetric heap）**：每个 PE 在相同偏移处分配相同大小的区域，所以一个本地指针可以换算成任一 PE 上的对应地址。代码里体现为：Triton-distributed 用 `nvshmem_create_tensor` 分配对称张量（`third_party/Triton-distributed/python/triton_dist/utils.py`），堆大小由 `NVSHMEM_SYMMETRIC_SIZE` 控制（`docs/testing.md` 的环境变量表）。
+
+下图示意对称堆的布局：各 PE 在相同偏移处有同样大小的区域，所以本地指针可以换算成任一 PE 上的对应地址（PE 数与张量个数为示意）。
+
+```text
+              PE 0                  PE 1                  PE 2
+offset 0   ┌───────────┐         ┌───────────┐         ┌───────────┐
+           │ tensor x  │         │ tensor x  │         │ tensor x  │
+offset k   ├───────────┤         ├───────────┤         ├───────────┤
+           │ tensor y  │         │ tensor y  │         │ tensor y  │
+           └───────────┘         └───────────┘         └───────────┘
+堆大小由 NVSHMEM_SYMMETRIC_SIZE 控制
+本地指针 p 指向 tensor x  ──►  dl.symm_at(p, rank) = 该 rank 上 tensor x 的同偏移地址
+```
+
 - **put / get**：单边的远端写 / 读；有 `nbi`（non-blocking implicit）变体，以及 thread / warp / block 粒度变体（见 Triton-distributed `docs/primitives.md` 中 `putmem_nbi_block`、`putmem_warp` 等清单）。
 - **signal**：带信号的 put（`putmem_signal*`，数据先到、再原子更新对端一个信号字）与 `signal_op`、`signal_wait_until`。接收方轮询信号即可知道数据可用——这正是通算融合里"依赖信号"的基础。
 - **fence / quiet**：`fence` 保证同一 PE 向同一目标的写入顺序；`quiet` 等待此前所有远端操作完成。两者名字都出现在 Triton-distributed 的 `libshmem_device` 清单中；语义细节为通用知识，待确认；确认方式：查 NVSHMEM 官方 API 文档。
@@ -35,6 +49,22 @@ RDMA NIC（见 ../01-rdma/README.md）
   - IBRC：GPU 把请求交给 CPU 上的 proxy 线程，由其用 IB Verbs（RC 连接）发给 NIC。控制路径要经 CPU，请求率受 CPU 线程限制。
   - IBGDA：GPU 线程自己构造 WQE 并敲 NIC doorbell，CPU 完全退出控制路径。代价是占 SM 构造请求、轮询完成。
   - 本仓库内的间接证据：Triton-distributed 的 `scripts/build_nvshmem_from_src.sh` 默认设置 `NVSHMEM_IBGDA_SUPPORT=1`，`docs/testing.md` 环境变量表列出 `NVSHMEM_IBGDA_SUPPORT`。书中第 6.4.4 节的"CPU 代理线程 / GPU 的 SM / 网卡上的处理器"三种发起位置，对应 IBRC / IBGDA / DPU 类方案，各自穿越 PCIe 3 / 2 / 0 次控制路径；第 7.3.2 节讨论 GPUDirect RDMA 与"由产生数据的加速器直接发起通信"。
+
+下图对比 IBRC（经 CPU proxy）与 IBGDA（GPU 线程直接发起）的控制路径：前者控制信号要经 CPU，书中第 6.4.4 节给出的 PCIe 穿越次数是 CPU 代理 3 次、GPU SM 发起 2 次。
+
+```text
+IBRC: GPU 经 CPU proxy
+┌─────────────────┐   ┌────────────────────┐   ┌───────┐
+│ GPU kernel      │   │ CPU proxy thread   │   │ NIC   │
+│ (put request)   │──►│ (IB Verbs, RC)     │──►│       │
+└─────────────────┘   └────────────────────┘   └───────┘
+
+IBGDA / GDAKI: GPU 线程构造 WQE 并直接敲 NIC doorbell
+┌──────────────────────┐   ┌──────────────┐
+│ GPU kernel threads   │   │ NIC          │
+│ build WQE            │──►│ (doorbell)   │
+└──────────────────────┘   └──────────────┘
+```
 
 ### 2. 与 NCCL 主机侧发起模型对比
 
@@ -84,6 +114,17 @@ NCCL@3e46c089（版本为 2.32.3，见 `third_party/nccl/makefiles/version.mk`�
 **device 侧接口**（`third_party/nccl/src/include/nccl_device/`，该目录 `README.md` 说明分层：公共声明 → `impl/*__types.h` → `impl/*__funcs.h`）
 - `core.h`：`ncclTeamWorld/Lsa/Rail`、`ncclGetLsaPointer(window, offset, peer)`（拿到 NVLink 域内对端指针直接 load/store）、`ncclGetLsaMultimemPointer`、GIN 类型 `NCCL_GIN_TYPE_PROXY / GDAKI / GPI / EFA_GDA`。
 - `gin.h`：`ncclGin` 会话，`put`、`putValue`、`flush`、`flushAsync`、`waitSignal`、`readSignal`、`waitCounter`；完成动作有"强/弱信号"之分：强信号表示可见时此前所有 put 均已完成，弱信号只保证捆绑的那次 put。
+
+下图对比强信号与弱信号的可见性保证：强信号可见时此前所有 put 都已完成，弱信号只保证捆绑的那次 put。
+
+```text
+sender      put(d1) ──► put(d2) + signal
+                                  │
+                                  ▼
+弱信号      receiver 看到 signal：d2（捆绑的那次 put）已到，d1 不保证已可见
+强信号      receiver 看到 signal：d1 与 d2 都已到
+```
+
 - `lsa_barrier.h`（`ncclLsaBarrierSession`：`arrive`、`wait`、`sync`，带 memory_order 参数）、`gin_barrier.h`、`barrier.h`、`ll_a2a.h`（低延迟 all2all）、`cft*.h`、`reduce_copy.h`。
 - GIN 后端实现：`src/gin/`（`gin_host.cc`、`gin_host_proxy.cc`、`proxy_gpucontext/`）、`src/include/nccl_device/gin/` 下 `gdaki/`、`proxy/`、`gpi/`、`efa_gda/`。
 - 对称内存的 kernel：`src/device/symmetric/`（`all_gather.cuh`、`all_reduce.cuh`、`reduce_scatter.cuh`、`all_gather_gin.cuh`、`reduce_scatter_gin.cuh`）；`NCCL_SYM_GIN_KERNELS_ENABLE` 见 `docs/userguide/source/env.rst`。

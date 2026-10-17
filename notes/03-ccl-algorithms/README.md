@@ -16,6 +16,20 @@
 | [04-all2all.md](04-all2all.md) | All2All 的 pairwise、直接 P2P、Bruck、分层算法；MoE dispatch/combine 的特殊性 | 为什么 MoE All2All 难优化；NCCL 的 `ncclAlltoAll` 是怎么实现的 |
 | [05-handwrite-ring-fullmesh.md](05-handwrite-ring-fullmesh.md) | **手写题**：Ring AllReduce / RS / AG、Full-mesh RS / AG / All2All 的 MPI 伪代码；Full-mesh one-shot / two-shot AllReduce 的 GPU kernel 伪代码（IPC + flag 屏障，对照 vLLM custom allreduce） | 面试白板上怎么写、下标怎么推、怎么避免死锁、何时选 Ring 或 Full-mesh |
 
+五篇之间的依赖关系（箭头表示"读后面一篇时会用到前面一篇的结论"）：
+
+```text
+01 primitives ──────► 02 alpha-beta model ──────► 03 NCCL algo x proto selection
+ (what each rank       (rounds vs bytes:            (src/tuning/ applies the same
+  holds before/after)   Ring, Tree, HD, Bruck)       model with tuned constants)
+        │                      │
+        │                      └──────────────► 04 All2All (pairwise / Bruck / MoE skew)
+        │                      │
+        └──────────────────────┴──────────────► 05 handwrite Ring / Full-mesh
+                                                      ▲
+                                    labs/ccl_sim ─────┘  (runnable reference + tests)
+```
+
 ## 配套实验
 
 `labs/ccl_sim/`（说明见 [labs/README.md](../../labs/README.md)）：用 Python list 模拟 N 个 rank 的 buffer，逐 step 执行 Ring、Recursive Doubling、Halving-Doubling、Binary Tree、Full-mesh（one-shot / two-shot）AllReduce，以及 Pairwise / Full-mesh All2All，并用 α-β 模型对比耗时。

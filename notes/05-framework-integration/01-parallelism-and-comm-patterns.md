@@ -31,6 +31,38 @@
 | CP（长上下文） | 同一序列的注意力 | Ring 传递 K/V（P2P），或 AllGather K/V，或合并 softmax 统计量 | 每块 K/V | 每层 d-1 轮 | 可与块内注意力计算重叠 |
 | 推理 DP-Attention + EP（DeepSeek 式） | attention 按请求 DP，MoE 按专家 EP | attention 后 gather/scatter token 到 MoE 组，再 All-to-All | 变长 | 每层 | 是 |
 
+把上表的前向通信标到一个 transformer 层（Attention 子块 + MLP/MoE 子块）上，看每种并行在哪个位置"欠"通信：
+
+```text
+  from stage s-1 ──► PP: Recv(activation)                      [P2P]
+          │
+ ┌────────▼─────────────────────┐
+ │ Norm                         │     SP: Norm 只算本卡的序列分片
+ │ QKV proj   (column-parallel) │ ◄── SP: 先 AllGather 补全序列；TP 按头切，无通信
+ │ core attn                    │ ◄── CP: 块间 Ring P2P 传 K/V（d-1 轮）
+ │ O proj     (row-parallel)    │ ──► TP: AllReduce 部分和（SP: 改为 ReduceScatter）
+ └────────┬─────────────────────┘
+         (+) residual
+ ┌────────▼─────────────────────┐
+ │ Norm                         │     SP: 同上，按序列分片
+ │ dense MLP:                   │
+ │   gate/up  (column-parallel) │ ◄── SP: AllGather
+ │   down     (row-parallel)    │ ──► TP: AllReduce（SP: ReduceScatter）
+ │ ---- or MoE: --------------- │
+ │   router -> top-k            │
+ │   dispatch                   │ ◄─► EP: All-to-All，token 发往专家所在 rank
+ │   expert FFN (grouped GEMM)  │
+ │   combine                    │ ◄─► EP: All-to-All，送回并按 top-k 权重求和
+ └────────┬─────────────────────┘
+         (+) residual
+          │
+          ▼
+  to stage s+1 ──► PP: Send(activation)                        [P2P]
+
+  不在单层前向里的：DP 训练在反向时按桶 AllReduce 梯度；ZeRO-3/FSDP 每层前向前、
+  反向前 AllGather 参数，反向后 ReduceScatter 梯度；DP-Attention 在 MoE 前 gather、后 scatter。
+```
+
 书中对应位置：
 - 并行方式一览（切分维度表）：`third_party/ai-infra-book/manuscripts/06-超节点.md` 6.1.4。
 - TP 每层两次 AllReduce、Qwen3-32B 64 层 → 每步 128 次 AllReduce，并给出 `T(p)=T_local/p + 128·T_AR(p)`：同文件 6.2.2。
@@ -80,6 +112,24 @@
 | DP-Attention | `third_party/sglang/python/sglang/srt/layers/dp_attention.py` `_dp_gather` / `dp_scatter` | attention-DP 与 MoE 组之间的 token 搬运 |
 | SP 式 RS/AG | `third_party/sglang/python/sglang/srt/layers/layer_boundary/ops.py` `tp_reduce_scatter` / `attn_tp_gather_input` | 层边界上把 AllReduce 换为 RS + AG |
 | PD KV | `third_party/vllm/vllm/distributed/kv_transfer/kv_connector/v1/base.py` `KVConnectorBase_V1`；`third_party/sglang/python/sglang/srt/disaggregation/base/conn.py` `BaseKVSender` | KV 传输抽象 |
+
+按 vLLM `initialize_model_parallel` 的 `torch.arange(world_size).reshape(-1, dp, pp, pcp, tp)` 手算一个小例子，看各组落在哪些 rank 上（world=8，dp=2、pp=2、pcp=1、tp=2，假设每节点 4 卡）：
+
+```text
+ rank = dp_i*4 + pp_i*2 + tp_i            （TP 是最内层，变化最快）
+
+               ┌────── node 0 (dp_i=0) ──────┐   ┌────── node 1 (dp_i=1) ──────┐
+  pp_i = 0     │      r0 ═════ r1            │   │      r4 ═════ r5            │
+               │      │        │             │   │      │        │             │
+  pp_i = 1     │      r2 ═════ r3            │   │      r6 ═════ r7            │
+               └─────────────────────────────┘   └─────────────────────────────┘
+                      ═══ TP 组    │ PP 组
+
+  TP : [0,1] [2,3] [4,5] [6,7]      ← 相邻 rank，同机 NVLink（每层 2 次串行 AllReduce）
+  PP : [0,2] [1,3] [4,6] [5,7]      ← 同一 dp 副本内相邻 stage
+  DP : [0,4] [1,5] [2,6] [3,7]      ← 跨节点（推理 DP 无模型内通信）
+  EP : [0,1,4,5] [2,3,6,7]          ← 同一 pp stage 内 DP×PCP×TP 拼成（仅 MoE 模型）
+```
 
 ## 性能要点与常见坑
 

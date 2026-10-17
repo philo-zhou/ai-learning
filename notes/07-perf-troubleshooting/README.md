@@ -19,6 +19,25 @@
 | [02-perf-methodology.md](02-perf-methodology.md) | 基线带宽、busbw 对比理论值、小消息延迟、拓扑核查、`NCCL_DEBUG_SUBSYS`、profiler 插件、nsys/NVTX |
 | [03-troubleshooting.md](03-troubleshooting.md) | hang、timeout、性能掉档、IB 链路、RAS 与内置诊断：症状 → 只读检查 → 可能原因 → 处理 |
 
+"一句话"里的三件事与三篇笔记的关系：
+
+```text
+  ┌──────────────────────────┐   compare   ┌──────────────────────────┐
+  │ what NCCL actually chose │ ◄─────────► │ what hardware can give   │
+  │ transport, channels,     │             │ NVLink / PCIe / NIC BW,  │
+  │ algo, proto, NIC, GDR    │             │ topology, link state     │
+  └────────────┬─────────────┘             └────────────┬─────────────┘
+               │ NCCL_DEBUG logs                        │ nvidia-smi topo -m, ibstat
+               └───────────────────┬────────────────────┘
+                                   ▼
+                       gap at which layer?
+          ┌────────────────────────┼─────────────────────────┐
+          ▼                        ▼                         ▼
+   01-env-vars.md        02-perf-methodology.md     03-troubleshooting.md
+   knobs and where       slow: baseline, locate,    hang / error / wrong data:
+   they are defined      A/B, real workload         symptom -> read-only check
+```
+
 ## 速查：最先打开的三个开关
 
 ```shell

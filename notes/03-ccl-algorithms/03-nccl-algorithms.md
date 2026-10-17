@@ -48,6 +48,21 @@ device 侧实现与之对应：`src/device/broadcast.h`、`reduce.h` 只有 RING
 几个实现细节：
 
 - **Ring AllReduce 的 kernel**（`src/device/all_reduce.h` 的 `runRing`）：把 channel 内数据按 `nranks * chunkCount` 为一轮循环；一轮里依次是 `directSend`（第 0 步）、`nranks-2` 次 `directRecvReduceDirectSend`（ReduceScatter）、1 次 `directRecvReduceCopyDirectSend`（得到最终结果并开始 AllGather）、`nranks-2` 次 `directRecvCopyDirectSend`、最后 `directRecv`。这正是 RS + AG 的 2(n-1) 步，且把"最后一次归约"和"第一次转发"融合成了一个原语。
+
+  按 `runRing` 中的 chunk 下标公式展开 nranks = 4，位于环上第 `ringIx` 个位置的 rank 依次执行（chunk 号均 mod 4；每一步收到的块正是环上前一个 rank 上一步发出的块）：
+
+  ```text
+  t  primitive                         chunk         recv  reduce  send
+  0  directSend                        ringIx-1       -      -      ✓     RS：发出自己那份
+  1  directRecvReduceDirectSend        ringIx-2       ✓      ✓      ✓     RS：收 + 累加 + 转发
+  2  directRecvReduceDirectSend        ringIx-3       ✓      ✓      ✓
+  3  directRecvReduceCopyDirectSend    ringIx         ✓      ✓      ✓     RS 收尾：第 ringIx 块全和写入结果，同时作为 AG 第一份发出
+  4  directRecvCopyDirectSend          ringIx-1       ✓      -      ✓     AG：收 + 写结果 + 转发
+  5  directRecvCopyDirectSend          ringIx-2       ✓      -      ✓
+  6  directRecv                        ringIx+1       ✓      -      -     AG：只收不发
+  ```
+
+  发送 6 次、接收 6 次，即 2(n-1)；下标与 [05](05-handwrite-ring-fullmesh.md) 题 1 伪代码（RS 第 s 步发 `r-s-1`，AG 第 s 步发 `r-s`）一致。
 - **Tree AllReduce 的 kernel**：`runTreeSplit` 把线程分成两组，一组沿树向上 Reduce、一组向下 Broadcast，两阶段同时推进；`runTreeUpDown` 先上后下，只在特定 CUDA 版本（11.2～11.4、SM80+）的 Simple 协议下使用。
 - **两棵树**：`ncclGetBtree` 构造"叶子与内部节点交替"的二叉树（注释中的 0-8-4-12… 图），`ncclGetDtree` 在 nranks 为偶数时取镜像、奇数时平移一位，得到第二棵树。树连接在 `src/graph/connect.cc` 的 `connectTrees` 中建立，环在 `connectRings`，另有 `connectCollNet`、`connectNvls`。
 
@@ -58,8 +73,29 @@ device 侧实现与之对应：`src/device/broadcast.h`、`reduce.h` 只有 RING
 | 协议 | 线格式（`src/include/device.h`） | 同步方式 | 有效带宽（`src/tuning/` 中的系数） | 适用 |
 |---|---|---|---|---|
 | LL（Low Latency） | `union ncclLLFifoLine`：16 B = `data1, flag1, data2, flag2`，每 8 B 中 4 B 数据 + 4 B flag | 接收方轮询 flag，数据和 flag 由同一次 8 B 原子写落地，无需额外 fence | 约 50%：`ring.cc` 中 `busBw * .5`（另有 `llMaxBws` 上限）；`tree.cc` 中 `busBw * 1.0 / 3.8` | 小消息，延迟最低 |
-| LL128 | `NCCL_LL128_LINESIZE 128`，`NCCL_LL128_DATAELEMS = LINEELEMS - 1`：每 128 B 中 120 B 数据 + 8 B flag | 以 128 B 为单位、依赖路径对 128 B 写入的顺序保证 | 约 92～94%：`ring.cc` 中 `busBw * (0.92 /*120.0/128.0*/)`，并受 `perChMaxRingLL128Bws` 限制 | 中等消息；只在满足条件的路径上启用 |
+| LL128 | `NCCL_LL128_LINESIZE 128`，`NCCL_LL128_DATAELEMS = LINEELEMS - 1`：每 128 B 中 120 B 数据 + 8 B flag | 以 128 B 为单位、依赖路径对 128 B 写入的顺序保证 | 理论 payload 占比 120/128 ≈ 94%；NCCL 的 Ring 代价模型取 92%（`src/tuning/ring.cc`：`busBw * (0.92 /*120.0/128.0*/)`），并受 `perChMaxRingLL128Bws` 限制 | 中等消息；只在满足条件的路径上启用 |
 | Simple | 普通大块缓冲 | 写完一个 chunk 后用内存 fence + 标志通知 | 接近 100% | 大消息，延迟最高 |
+
+两种低延迟协议的线格式（`src/include/device.h`）画出来就是下面的比例；LL 的 flag 紧跟在同一个 8 B 里的数据之后（`ncclLLFifoLine` 注释要求 flag 在数据之后），LL128 只示意"120 B 数据 + 8 B flag"的比例，flag 在行内的具体位置以 `src/device/prims_ll128.h` 为准：
+
+```text
+LL: one ncclLLFifoLine = 16 B
+  byte 0        4        8        12       16
+       ┌────────┬────────┬────────┬────────┐
+       │ data1  │ flag1  │ data2  │ flag2  │
+       └────────┴────────┴────────┴────────┘
+       ◄─ 8 B atomic ───►◄─ 8 B atomic ───►        payload 8/16 = 50%
+
+LL128: one line = NCCL_LL128_LINESIZE = 128 B = 16 x uint64
+       ┌────────────────────────────────────────────────┬──────┐
+       │ data: NCCL_LL128_DATAELEMS = 15 x uint64       │ flag │
+       └────────────────────────────────────────────────┴──────┘
+       ◄──────────────────── 120 B ────────────────────►◄ 8 B ►   payload 120/128 ≈ 94%
+
+Simple: large chunk of plain data, then fence + flag per chunk     payload ≈ 100%
+```
+
+接收方只要轮询到 flag 等于本轮期望值，就知道同一行里的数据已经可用，不必再等一次单独的同步，这就是 LL/LL128 延迟低的原因；代价是每行都要让出一部分字节给 flag。
 
 LL128 何时可用：`src/tuning/cost_model.cc` 的 `isLL128Enabled` 要求节点内路径 `intraType <= PATH_NVB`；节点间路径默认 `interType <= PATH_PXB`，在 SM90+ 且 `NCCL_LL128_C2C`（默认 1）开启时放宽到 `PATH_PXN`；还要求 SM70+、各 GPU 算力一致或都在 SM90+。原因（我的理解）：LL128 依赖"128 B 内的数据先于 flag 可见"，只有某些路径能保证。
 
@@ -127,7 +163,7 @@ time(μs) = lat × latCount + nBytes / (1000 × bw)
 1. **NCCL 怎么选算法和协议？**
    要点：每个 (algo, proto) 一个 α-β 模型，Init 时按拓扑预计算延迟与带宽，调用时 `time = lat × latCount + nBytes / bw`，遍历候选取最小；可被 `NCCL_ALGO`/`NCCL_PROTO`、per-call 配置、tuner 插件覆盖。
 2. **LL、LL128、Simple 的区别？**
-   要点：LL 每 8 B 中 4 B 数据 4 B flag，靠 8 B 原子写同时落地，免 fence，延迟最低、带宽约一半；LL128 每 128 B 中 120 B 数据，带宽约 94%，依赖路径对 128 B 写入的顺序保证；Simple 大块 + fence + flag，带宽最高、延迟最高。
+   要点：LL 每 8 B 中 4 B 数据 4 B flag，靠 8 B 原子写同时落地，免 fence，延迟最低、带宽约一半；LL128 每 128 B 中 120 B 数据，理论带宽约 94%（120/128，NCCL Ring 代价模型按 0.92 估），依赖路径对 128 B 写入的顺序保证；Simple 大块 + fence + flag，带宽最高、延迟最高。
 3. **NCCL 的 Tree 是什么样的树？为什么节点内是链？**
    要点：节点间用 Double Binary Tree（镜像/平移得到第二棵）；节点内 GPU 由 NVLink/NVSwitch 高带宽连接，链的线性延迟项很小，且链便于流水；模型中延迟为 `2*((ppn-1)*intraLat + log2(nNodes)*interLat)`。
 4. **NVLS 为什么能让 AllReduce 的 busbw 很高？**

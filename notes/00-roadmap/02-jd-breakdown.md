@@ -13,6 +13,25 @@
 - 实践列中 `labs/ccl_sim/` 已建成（`python3 -m labs.ccl_sim`、`python3 scripts/check_repo.py labs`），其余 `labs/` 子目录为计划新建的实验，标"待建"。
 - 实践需要的硬件：标 [CPU] 的可在笔记本完成；[1×GPU]/[多GPU]/[RDMA] 需要对应机器。
 
+下图把后文各表的"notes 目录"列汇总成一张矩阵：X 表示该 JD 条目至少有一个知识点落在这个目录（01~02 下层、03~04 中层、05 上层、06 跨层、07 实践）。可以据此看出 04-nccl-internals 覆盖的 JD 条目最多（5 条）。
+
+```text
+      │   01       02       03       04       05       06       07    │
+      │  rdma    scaleup   algo     nccl     frame   fusion    perf   │
+──────┼───────────────────────────────────────────────────────────────┤
+  R1  │    .        .        X        X        .        .        X    │
+  R2  │    X        X        .        X        .        .        .    │
+  R3  │    .        .        .        .        .        X        .    │
+  R4  │    .        X        X        X        X        .        .    │
+  R5  │    .        .        .        .        X        .        X    │
+  Q1  │    X        X        .        .        X        .        .    │
+  Q2  │    X        .        .        .        .        .        .    │
+  Q3  │    .        .        X        X        .        .        .    │
+  Q4  │    .        .        .        X        .        .        .    │
+  Q5  │    .        .        .        .        .        .        X    │
+──────┴───────────────────────────────────────────────────────────────┘
+```
+
 ## 职责拆解
 
 ### R1 负责 CCL 设计开发优化，支持多卡/多机通信
@@ -101,7 +120,7 @@
 |---|---|---|---|
 | Ring：$2(n-1)$ 步，每卡发送 $2(n-1)M/n$ | [03-ccl-algorithms](../03-ccl-algorithms/README.md) | [CPU] `labs/ccl_sim/` 逐步模拟，测试断言步数与发送量 | 未开始 |
 | Tree / double binary tree：$O(\log n)$ 轮，pipeline 分段 | [03-ccl-algorithms](../03-ccl-algorithms/README.md) | 阅读 `third_party/nccl/src/graph/trees.cc`、`src/device/all_reduce.h` 的 `runTreeUpDown`/`runTreeSplit` | 未开始 |
-| Recursive Halving-Doubling（Rabenseifner）、Recursive Doubling | [03-ccl-algorithms](../03-ccl-algorithms/README.md) | [CPU] `labs/ccl_sim/` 已实现并与 ring 对比；NCCL 中无独立 Halving-Doubling 算法，候选表见 `third_party/nccl/src/config/algorithm_registry.cc`（详见 03-ccl-algorithms） | 未开始 |
+| Recursive Halving-Doubling（Rabenseifner）、Recursive Doubling | [03-ccl-algorithms](../03-ccl-algorithms/README.md) | [CPU] `labs/ccl_sim/` 已实现并与 ring 对比；NCCL 中无独立 Halving-Doubling 算法（`NCCL_ALGO_*` 只有 Tree/Ring/CollNet×2/NVLS/NVLSTree/PAT，候选表见 `third_party/nccl/src/config/algorithm_registry.cc`；最接近的是只做 AG/RS 的 PAT，详见 03-ccl-algorithms） | 未开始 |
 | PAT、NVLS、CollNet 等 NCCL 内置算法 | [04-nccl-internals](../04-nccl-internals/README.md) | 阅读 `third_party/nccl/src/tuning/pat.cc`、`nvls.cc`、`collnet.cc` | 未开始 |
 | 拓扑感知算法（Swing、分层） | [03-ccl-algorithms](../03-ccl-algorithms/README.md) | 书 §6.5.1；`case-studies/network-planning-and-collectives.md` | 未开始 |
 

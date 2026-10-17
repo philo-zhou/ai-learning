@@ -20,6 +20,26 @@
 - NCCL 不给集合操作设整体超时：GPU kernel 在 primitives 的 `waitPeer` 中自旋，每 `NCCL_SPINS_BEFORE_CHECK_ABORT`（10000）次检查一次 abort 标志（`src/device/primitives.h`）。"timeout" 通常来自三处：框架看门狗（如 PyTorch，不在本仓库）、IB 传输层重传耗尽（`NCCL_IB_TIMEOUT`/`NCCL_IB_RETRY_CNT`）、bootstrap/socket 连接重试（`NCCL_SOCKET_RETRY_CNT` 等）。
 - 中止：`ncclCommAbort`（`src/init.cc:3489`）设置 abort 标志让 kernel 和 proxy 退出；`ncclCommRevoke`、`ncclCommShrink` 用于容错场景下剔除故障 rank。
 
+把上面几条放在一起：NCCL 自己不会"超时"，能让一次等待结束或暴露出来的只有这几条路径。
+
+```text
+  GPU kernel (primitives.h)
+    waitPeer spin ──► every NCCL_SPINS_BEFORE_CHECK_ABORT (10000) spins: check abort flag
+                                                                          ▲
+  framework watchdog (e.g. PyTorch, not in this repo)                     │
+    collective not done in time ──► ncclCommAbort ──► set abort flag ─────┘
+
+  IB transport layer
+    retransmit exhausted (NCCL_IB_TIMEOUT, NCCL_IB_RETRY_CNT)
+      ──► WARN "NET/IB: Got completion from peer ... status=..."
+      ──► proxy progressOps returns error
+      ──► ncclProxyProgress stores proxyState->asyncResult, leaves loop
+      ──► app sees it only via ncclCommGetAsyncError
+
+  bootstrap / socket (init)
+    connect retries exhausted (NCCL_SOCKET_RETRY_CNT ...) ──► init returns error
+```
+
 ### RAS 子系统（`src/ras/`）
 
 - `ras.rst`：NCCL 2.24 起提供，init 时启动（`NCCL_RAS_ENABLE` 默认 1，`src/ras/ras.cc:91`），每进程一组线程，经 bootstrap 使用的 OOB 网卡建立 TCP 连接、互发 keep-alive；进程崩溃或卡死时，其他进程的 RAS 线程能通过连接断开或无响应感知。
@@ -27,7 +47,42 @@
 - 诊断（`diagnostics.rst`）：RAS 诊断被动比较各 rank 的 GPU、驱动与 NCCL 配置（`ncclras -D` 或 `NCCL_RUN_RAS_DIAGNOSTICS`）；主动诊断 `NCCL_RUN_DIAGNOSTICS=1` 在 comm init 时实际验证 P2P 访问、IB 带宽等路径，rank 0 输出 `NCCL DIAG [OK]/[INFO] ...`（实现：`src/diagnostics.cc`、`src/diagnostics/p2p.cc`、`src/diagnostics/ib_write_bw.cc`、`src/ras/diagnostics_{gpu,pci,paths,env,xid}.cc`）。
 - 进度计数：`NCCL_PROGRESS_COUNTERS=1` 且 RAS 开启时（`src/init.cc:805`），`src/ras/progress_monitor.cc` 按 `NCCL_PROGRESS_COUNTER_MONITOR_POLL_MS`（1000）轮询设备侧进度计数镜像，供 RAS 判断谁在前进。
 
+RAS 的结构：每个进程一组 RAS 线程，彼此经 OOB 网卡的 TCP 连接互发 keep-alive；运维在任一节点用客户端连本机端口即可拿到全局视图。
+
+```text
+  node A                                   node B
+  ┌──────────────────────────┐             ┌──────────────────────────┐
+  │ rank 0..7 processes      │             │ rank 8..15 processes     │
+  │   NCCL comms             │             │   NCCL comms             │
+  │   RAS threads ◄──────────┼─ TCP over ──┼─► RAS threads            │
+  │     listen :28028        │  OOB NIC    │     listen :28028        │
+  └────────────▲─────────────┘ keep-alive  └──────────────────────────┘
+               │
+   ncclras -v  /  echo verbose status | nc localhost 28028
+   → job summary (nodes, processes, GPUs) + per-communicator state / errors
+   peer crashed or stuck → connection drop / no response seen by other RAS threads
+```
+
 ## 排查清单
+
+先按症状分流到下面 A~E 五张表，再在表内按"只读检查"一列逐项排除：
+
+```text
+  symptom
+  │
+  ├─ never reaches "Init COMPLETE" / init returns error ───────────► A. init
+  │
+  ├─ running, GPU 100%, progress stopped
+  │    ├─ all ranks in NCCL? (ncclras -v, host stacks, COLL opCount)
+  │    │    ├─ no:  some rank late / crashed / different call ─────► B. hang (app side)
+  │    │    └─ yes: only cross-node ranks stuck ───────────────────► B + D (proxy / IB)
+  │    └─ (may also be readiness skew: slow compute / IO on one rank)
+  │
+  ├─ works but slower than before ─────────────────────────────────► C. perf drop
+  │    └─ log shows NET/IB WARN or async event ────────────────────► D. IB / RoCE
+  │
+  └─ #wrong != 0 or loss abnormal ─────────────────────────────────► E. data error
+```
 
 ### A. init 阶段卡住或失败
 
@@ -104,7 +159,7 @@ ai-infra-book 7.6.1 提醒：一张卡早进入集合通信调用而别的卡还
 
 - 不要在 hang 时直接重启：先 `ncclras -v`、dump proxy、抓主机栈，信息只在现场。
 - `NCCL_DEBUG=INFO` 产生大量日志，按子系统过滤并写文件（`NCCL_DEBUG_FILE=...%h.%p`）。
-- 环境变量在进程内首次读取后缓存（`NCCL_PARAM` 实现），"改了没生效"多因设置太晚或被 `/etc/nccl.conf` 覆盖。
+- 环境变量在进程内首次读取后缓存（`NCCL_PARAM` 实现），"改了没生效"多因设置太晚（NCCL 已读过并缓存）。配置文件不会覆盖已设置的环境变量（`src/os/linux.cc::ncclOsSetEnv` 用 `setenv(name, value, 0)`），但会为未设置的变量补值：先读用户配置（`NCCL_CONF_FILE`，未设则 `~/.nccl.conf`），再读 `/etc/nccl.conf`（`src/misc/param.cc::initEnvFunc`），所以"没设却生效了某个值"要查这两个文件。
 - 强制变量（`NCCL_IGNORE_DISABLED_P2P`、`NCCL_PROTO` 等）只能用于定位，不能当修复。
 - 改 ACS、加载内核模块、调整端口范围等属于系统变更，需要运维授权。
 

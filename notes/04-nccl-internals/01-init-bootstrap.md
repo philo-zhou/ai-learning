@@ -18,7 +18,7 @@
 |---|---|
 | `ncclUniqueId` | 128 字节不透明 id；内部是 `struct ncclBootstrapHandle`（root 监听地址 `addr` + 随机 `magic`），见 `ncclGetUniqueId` 中的 `memcpy(out, &handle, sizeof(handle))` |
 | bootstrap root | `bootstrapCreateRoot` 起的一个分离线程 `bootstrapRoot`（线程名 `NCCL BootstrapR`），收集所有 rank 的监听地址，再把"下一个 rank 的地址"发回去 |
-| bootstrap 环 | 每个 rank 只连自己的 next，形成 TCP 环；`bootstrapAllGather` 用 ring allgather 在这个环上交换数据 |
+| bootstrap 环 | 每个 rank 只连自己的 next，形成 TCP 环；`bootstrapAllGather` 在这个环上做 allgather：默认 socket 路径 `socketRingAllGather` 是双向环（同时沿 next 和 prev 两个方向各走一个环，`totalSteps = nranks / 2`，约 n/2 步）；`NCCL_OOB_NET_ENABLE=1`（`ncclParamBootstrapNetEnable`）时的 `netRingAllGather` 是单向环（n−1 步） |
 | OOB 网卡 | `bootstrapNetInit` 选的那块 IP 网卡，受 `NCCL_SOCKET_IFNAME`、`NCCL_SOCKET_FAMILY`、`NCCL_COMM_ID` 影响 |
 | 异步 init | `ncclCommInitRankDev` 只做参数检查和分配，真正工作 `ncclCommInitRankFunc` 作为 async job 执行；非阻塞模式下返回 `ncclInProgress` |
 
@@ -56,6 +56,28 @@
 - `ncclCommInitRankDev`：`ncclInit`、`cudaFree(NULL)` 强制创建 CUDA context、分配 `comm`、`abortFlag`、`parseCommConfig`，设置 `comm->initState = ncclInProgress`；把 `ncclCommInitRankFunc` 交给 `ncclAsyncLaunch`（或 `ENQUEUE_REARCH_ENABLE` 下的 `ncclMgmtTaskEnqueue`）。
 - `ncclCommInitRankFunc`：`ncclInitKernelsForDevice` → `commAlloc` → `bootstrapInit`（或 split/shrink 时 `bootstrapSplit`）→ `initTransportsRank` → `ncclProgressCounterMonitorInit` → `initState = ncclSuccess`，并打印 `Init COMPLETE` 与 `Init timings`（kernels/alloc/bootstrap/allgathers/topo/graphs/connect 各阶段耗时）。
 
+下图把这三层调用叠在一起看：`ncclCommInitRankDev` 只登记 job，真正的工作在 `ncclGroupEndInternal` 把 group depth 减到 0 时才执行（`src/group.cc::ncclAsyncLaunch` 在 depth > 0 时把 job 放进 `ncclAsyncJobs` 队列，由 `asyncJobLaunch` 执行）。
+
+```text
+ncclCommInitRank
+ ├─ ncclInitEnv / ncclCudaLibraryInit
+ ├─ ncclGroupStartInternal                          ← group depth +1
+ ├─ ncclCommInitRankDev                             ← 调用线程里同步执行
+ │   ├─ ncclInit            (initOnceFunc: bootstrapNetInit ...)
+ │   ├─ cudaFree(NULL), alloc comm / abortFlag, parseCommConfig
+ │   ├─ comm->initState = ncclInProgress
+ │   └─ ncclAsyncLaunch(ncclCommInitRankFunc) ──┐   ← depth > 0：只入队
+ │                                              │
+ └─ ncclGroupEndInternal ◄──────────────────────┘   ← depth 归零：执行队列里的 job
+      └─ ncclCommInitRankFunc
+          ├─ ncclInitKernelsForDevice
+          ├─ commAlloc
+          ├─ bootstrapInit  (or bootstrapSplit)     → 第 5 节
+          ├─ initTransportsRank                     → 第 6 节
+          ├─ ncclProgressCounterMonitorInit
+          └─ initState = ncclSuccess, "Init COMPLETE"
+```
+
 ### 5. `bootstrapInit`：拼环
 
 `src/bootstrap.cc::bootstrapInit` 主要步骤（按源码注释）：
@@ -68,6 +90,31 @@
 6. 创建 proxy 监听 socket、UDS（用于 cuMem fd 传递）、P2P socket，并初始化 RAS（`ncclRasAddRanks`）。
 7. `ringAllInfo` 在环上交换所有 rank 的 proxy/P2P 地址。
 8. `ncclProxyInit` 建 proxy 服务的基础状态。
+
+下图是单个 unique id（单 root）时，从 `ncclGetUniqueId` 到 bootstrap 环成形的时序。root 线程（`bootstrapRoot`）对每个 rank r 回发的是 rank r+1 的环监听地址（源码中 `rootSend(&info.listenRootAddress, magic, &rankInfo[next])`），谁先到就先存着，等邻居到齐再发；最后一个 rank 的 next 回绕到 rank 0。
+
+```text
+ rank 0 process                  root thread                     rank r (0..n-1)
+ ───────────                     ("NCCL BootstrapR")             ───────────────
+ ncclGetUniqueId
+  └ bootstrapGetUniqueId
+     ├ handle = {addr, magic}
+     └ bootstrapCreateRoot ──────► listen on handle.addr
+ ncclUniqueId (128 B) ═══ broadcast by framework (store / MPI) ► same id
+                                                                 ncclCommInitRank(.., id, r)
+                                                                  └ bootstrapInit
+                                                                     ├ listen: ring socket  (addr_r)
+                                                                     ├ listen: listenSockRoot
+                                    ◄──── sendToRoot ────────────────┤ {rank r, addr_r, rootAddr_r}
+                                  store rankInfo[r];
+                                  when rank r+1 checked in:
+                                    ───── rootSend(rootAddr_r) ─────►│ nextPeer = addr_(r+1)
+                                                                     ├ socketRingConnect
+                                                                     │   send ──► rank r+1
+                                                                     │   recv ◄── rank r-1
+                                                                     ├ ringAllInfo  (proxy / P2P addrs)
+                                                                     └ ncclProxyInit
+```
 
 `bootstrapAllGather` 根据 `ncclParamBootstrapNetEnable()` 选 `netRingAllGather` 或 `socketRingAllGather`；另有 `bootstrapSend/Recv`（点对点，带 tag 和 unexpected 队列）、`bootstrapBarrier`、`bootstrapIntraNodeAllGather`、`bootstrapIntraNodeBarrier`。
 
@@ -90,6 +137,29 @@
 | tuning | `ncclTuningInit` | 初始化代价模型、读取 `NCCL_ALGO/PROTO` |
 | 设备侧 | `devCommSetup` | 把 channel、peer 连接信息拷到 GPU；注释说明必须在最后一个 barrier 前做，否则可能死锁 |
 | 收尾 | `bootstrapIntraNodeBarrier` | 节点内同步，恢复 CPU 亲和 |
+
+把上表按"本地计算 / 跨 rank 通信"拆成两列看，就能看清面试常问的"几次 AllGather、分别在哪一步"：
+
+```text
+ local work on this rank                      cross-rank exchange
+ ───────────────────────                      ───────────────────
+ fillInfo ──────────────────────────────────► bootstrapAllGather(peerInfo)          ← AllGather1
+ ncclMnnvlCheck
+ ncclTopoGetSystem ─────────────────────────► bootstrapIntraNodeAllGather(XML)      ← 只在节点内
+ ComputePaths → TrimSystem → ComputePaths
+ ncclTopoSearchInit
+ ncclTopoCompute(ring/tree/collNet/nvls)
+ ncclTopoPreset ────────────────────────────► bootstrapAllGather(allGather3Data)    ← AllGather3
+ ncclTopoPostset      (global ring/tree, nChannels = min)
+ computeBuffSizes, ncclTopoComputeP2pChannels
+ ncclProxyCreate
+ runtimeConn ?
+   ├ yes: setupChannel + ncclNvlsSetup        (连接推迟到首次使用)
+   └ no : ncclTransportRingConnect → TreeConnect → ... ──► transport 建连 (P2P/SHM/NET)
+ ncclTuningInit
+ devCommSetup  ──► copy channels / peers to GPU
+ ───────────────────────────────────────────► bootstrapIntraNodeBarrier             ← 节点内收尾
+```
 
 ## 性能要点与常见坑
 

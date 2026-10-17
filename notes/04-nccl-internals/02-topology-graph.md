@@ -37,7 +37,32 @@ NCCL 先把本机 GPU、PCIe 交换芯片、CPU(NUMA)、NVSwitch、网卡组织�
 | 10 | `PATH_NET` | 经网络 |
 | 11 | `PATH_DIS` | 不连通 |
 
-字符串表 `topoPathTypeStr = {"LOC","NVL","NVB","C2C","PIX","PXB","P2C","PXN","PHB","SYS","NET","DIS"}`（`src/graph/topo.cc:35`）。数值越大越"远"，NCCL 用 `path->type <= level` 判断是否允许某种 transport。`nvidia-smi topo -m` 的 NV#/PIX/PXB/PHB/SYS/NODE 与之大体对应（待确认：`NODE` 与 NCCL 的哪一类对应；确认方式：在真实机器上对比 `nvidia-smi topo -m` 与 `NCCL_TOPO_DUMP_FILE` 导出的 XML 以及 `NCCL_DEBUG_SUBSYS=GRAPH` 的路径打印）。
+字符串表 `topoPathTypeStr = {"LOC","NVL","NVB","C2C","PIX","PXB","P2C","PXN","PHB","SYS","NET","DIS"}`（`src/graph/topo.cc:35`）。数值越大越"远"，NCCL 用 `path->type <= level` 判断是否允许某种 transport。
+
+下面用一棵虚构的双路服务器 PCIe 树（示意，不对应某台真实机器）把上表几种常见路径类型落到具体节点对上；路径类型取沿途"最差的一段"：
+
+```text
+                 CPU0 ◄──── QPI / UPI ────► CPU1
+                  │                          │
+          ┌───────┴────────┐           GPU4..7, NIC1
+       PCI sw A         PCI sw D
+          │                │
+     ┌────┴─────┐         GPU3
+  PCI sw B   PCI sw C
+     │          │
+  ┌──┴──┐    ┌──┴──┐
+ GPU0  GPU1 GPU2  NIC0
+  └═NVL═┘
+
+ GPU0 ↔ GPU1 : NVL    direct NVLink
+ GPU2 ↔ NIC0 : PIX    one PCIe bridge (sw C)
+ GPU0 ↔ GPU2 : PXB    sw B → sw A → sw C, no host bridge
+ GPU0 ↔ NIC0 : PXB    same as above       ← 未超过默认 netGdrLevel=PXB，距离上允许 GDR
+ GPU0 ↔ GPU3 : PHB    through CPU0 host bridge
+ GPU0 ↔ GPU4 : SYS    crosses CPU0 ↔ CPU1  ← 超过默认 p2pLevel=PXB，默认不走 P2P
+```
+
+`nvidia-smi topo -m` 的 NV#/PIX/PXB/PHB/SYS/NODE 与之大体对应（待确认：`NODE` 与 NCCL 的哪一类对应；确认方式：在真实机器上对比 `nvidia-smi topo -m` 与 `NCCL_TOPO_DUMP_FILE` 导出的 XML 以及 `NCCL_DEBUG_SUBSYS=GRAPH` 的路径打印）。
 
 ### 带宽常量（`src/graph/topo.h`，单位 GB/s，NCCL 内部模型值）
 
@@ -80,9 +105,31 @@ NCCL 先把本机 GPU、PCIe 交换芯片、CPU(NUMA)、NVSwitch、网卡组织�
 2. 若设 `NCCL_GRAPH_FILE`，直接从 XML 载入通道（`ncclTopoGetGraphFromXml`），跳过搜索。
 3. 速度档位：从 `speedArrayIntra`/`speedArrayInter`（`search.cc` 中如 `{40.0, 30.0, 20.0, ...}`）选不超过系统最大带宽的档位作为每通道目标带宽。
 4. `ncclTopoSearchRec` → `ncclTopoSearchRecGpu` / `ncclTopoSearchRecNet`：回溯尝试 GPU 顺序和网卡选择，每走一步用 `ncclTopoFollowPath` 在链路上"扣减"带宽，扣不下就回退。搜索步数预算由 `search.cc:333-336` 的常量控制：`NCCL_SEARCH_GLOBAL_TIMEOUT (1ULL << 19)`、`NCCL_SEARCH_TIMEOUT (1 << 14)`、`NCCL_SEARCH_TIMEOUT_TREE (1 << 14)`、`NCCL_SEARCH_TIMEOUT_SAMECHANNELS (1 << 8)`。
-5. 第一轮（pass 1）找不到满意解时依次放宽：`sameChannels=0` → `typeIntra += 1` → `typeInter += 1` → 允许 `crossNic` → 降低速度档位。
-6. 找到解后进入 pass 2：在当前解基础上尝试提高 `bwIntra/bwInter`。
-7. `ncclTopoDupChannels`：带宽足够高时把通道复制一倍（`bwIntra` 相应减半），以用满链路。
+5. 第一轮（pass 1）找不到满意解时依次放宽：`sameChannels=0` → （`ccMin >= 90` 且 pattern 为 `BALANCED_TREE` 时）先退回 `TREE` → `typeIntra += 1` → `typeInter += 1` → 允许 `crossNic` → 降低速度档位。
+6. 找到解（`done:`）且仍处于 pass 1 时，先调用一次 `ncclTopoDupChannels`：带宽足够高时把通道复制一倍（`bwIntra` 相应减半），以用满链路。
+7. 随后切换到 pass 2：以复制后的解为起点（`minChannels = graph->nChannels`）尝试提高 `bwIntra/bwInter`；pass 2 不再调用 `ncclTopoDupChannels`。
+
+下图按 `search.cc` 中 `ncclTopoCompute` 的 `goto search` 分支画出 pass 1 的放宽顺序；左侧每一行表示"放宽一项后回到 search"，放宽失败就把该项复位再试下一项。其中"BALANCED_TREE → TREE"一步对应源码注释 "Try a simpler tree"。
+
+```text
+             ┌──────────────────────────────┐
+   ┌────────►│ search: ncclTopoSearchRec    │
+   │         └──────────────┬───────────────┘
+   │                        ▼
+   │         time == -1 (PERFECT) or  ──yes──► done
+   │         nChannels*bwInter >= totalBw
+   │                        │ no (pass 1)
+   │                        ▼
+   ├──────── sameChannels 1 → 0               (AMD x86 + PATH_SYS 除外)
+   ├──────── BALANCED_TREE → TREE             (ccMin >= 90)
+   ├──────── typeIntra += 1
+   ├──────── typeInter += 1                   (system->inter 时)
+   ├──────── crossNic 0 → 2                   (NCCL_CROSS_NIC=2, RING / BALANCED_TREE)
+   └──────── speedIndex++  (lower bw target)
+                            │ nothing left to relax
+                            ▼
+ done: pass 1 → ncclTopoDupChannels → pass 2: try raising bwIntra / bwInter, goto search
+```
 
 `ncclTopoPrintGraph` 打印 `Pattern %d, crossNic %d, nChannels %d, bw %f/%f, type %s/%s, sameChannels %d`，这是读懂 `NCCL_DEBUG_SUBSYS=GRAPH` 日志的关键行。`NCCL_GRAPH_DUMP_FILE` 可导出搜索结果（`ncclTopoDumpGraphs`），配合 `NCCL_GRAPH_FILE` 复现/固定通道。
 
@@ -91,6 +138,21 @@ NCCL 先把本机 GPU、PCIe 交换芯片、CPU(NUMA)、NVSwitch、网卡组织�
 - `ncclTopoPreset`：用本节点搜出的 `intra[]` 设置每个通道 ring 的 prev/next、tree 的 up/down（节点内部分）。
 - AllGather3 后 `ncclTopoPostset`：把各节点通道首尾（`ringRecv/ringSend`，即每节点进出网络的 GPU）串成跨节点 ring；用 `ncclGetBtree`/`ncclGetDtree`（`trees.cc`）构建跨节点的双二叉树；源码注释 "Alternate rings to avoid crossing rails"；处理 `NCCL_MIN_NCHANNELS`/`NCCL_MAX_NCHANNELS`（`connect.cc:331-332`）。
 - `rings.cc::ncclBuildRings` 生成最终 ring 并打印 `Channel %02d/%02d : r0 r1 ...`。
+
+以 2 节点 × 4 GPU、某个通道节点内顺序为 `0 1 2 3` / `4 5 6 7` 为例：`ncclTopoPreset` 只填节点内的 prev/next，并记下每节点的入口 `ringRecv = intra[0]`、出口 `ringSend = intra[last]`；`connect.cc::connectRings` 再按 `next[send[n]] = recv[n+1]`、`prev[recv[n]] = send[n-1]` 把各节点首尾相接（rank 编号仅为示意）：
+
+```text
+  node 0 (Preset, intra-node)                 node 1 (Preset, intra-node)
+  ringRecv                     ringSend       ringRecv                     ringSend
+     │                             │             │                             │
+     ▼                             ▼             ▼                             ▼
+  ┌─────┐   ┌─────┐   ┌─────┐   ┌─────┐       ┌─────┐   ┌─────┐   ┌─────┐   ┌─────┐
+  │  0  │──►│  1  │──►│  2  │──►│  3  │══NET═►│  4  │──►│  5  │──►│  6  │──►│  7  │
+  └─────┘   └─────┘   └─────┘   └─────┘       └─────┘   └─────┘   └─────┘   └─────┘
+     ▲                                                                         ║
+     ╚══════════════════════════════════ NET ══════════════════════════════════╝
+             ──►  set by ncclTopoPreset         ══►  set by connectRings (Postset)
+```
 
 ## 性能要点与常见坑
 

@@ -20,7 +20,7 @@ MoE 的 dispatch/combine 是"动态、不均匀、要和 token 重排融合"的 
 |---|---|---|
 | [01-design-space.md](01-design-space.md) | EP All2All 的设计空间：槽位分配、完成信号、缓冲区、分层、SM 占用 | "设计一个 EP 通信库要做哪几个决定" |
 | [02-deepep-low-latency.md](02-deepep-low-latency.md) | DeepEP LL：dispatch/combine kernel、IBGDA、双缓冲、recv hook、LogFMT、NVLink 旁路 | "decode 的 dispatch 为什么能做到 ~100 µs、还不占 SM" |
-| [03-hybrid-ep.md](03-hybrid-ep.md) | Hybrid-EP：路由预处理、四类 warp group、DOCA GPUNetIO RDMA、chunk 标志、combine 节点内预归约、permute 融合 | "大 batch 下怎样用 4~16 个 SM 跑满网卡" |
+| [03-hybrid-ep.md](03-hybrid-ep.md) | Hybrid-EP：路由预处理、warp 专业化（dispatch 每 block 3 类 warp group 共 4 warp，combine 5 类 warp group 共 6/11 warp）、DOCA GPUNetIO RDMA、chunk 标志、combine 节点内预归约、permute 融合 | "大 batch 下怎样用 4~16 个 SM 跑满网卡" |
 | [04-lineage-and-selection.md](04-lineage-and-selection.md) | 谱系（V1 → Hybrid-EP → NCCL EP → DeepEP V2.5）、横向对比、框架里怎么选 | "面试时怎么把几个方案放在一张表里讲清楚" |
 
 ## 读这一章的顺序

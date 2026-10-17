@@ -20,6 +20,48 @@ NVLink 是 GPU 之间（以及 Grace-GPU 之间）的高带宽点对点链路，
 - 第 7 章 7.1.3 的说法：紧耦合互联把设备接到处理器和内存系统上，适合频繁、细粒度协作；集群网络连接大量独立节点，还要处理节点和链路故障。同一份数据在机内和跨机传输往往要用不同接口（load/store vs 异步 read/write 请求）。
 - 第 7 章 7.3.3 区分 Load/Store（处理器指令，硬件跟踪依赖）与异步 Read/Write（提交请求到队列，运行时等完成事件），并提醒不能凭接口名称推断缓存一致性。
 
+下图把两层放在一起看：域内 GPU 经 NVSwitch 互相 load/store，域外每块 GPU 经 PCIe 上的网卡进入集群网络（带宽取书中 H100 例，每卡一块 400 Gbit/s 网卡）。
+
+```text
+  NVLink domain (scale-up: 8-GPU server, or NVL72 rack)
+  ┌────────────────────────────────────────────┐
+  │        ┌──────────────────────────┐        │
+  │        │     NVSwitch (SHARP)     │        │  ← 内存语义：load/store
+  │        └──┬──────┬──────┬──────┬──┘        │    H100 每卡每方向 450 GB/s
+  │           │      │      │      │  NVLink   │
+  │        ┌──┴─┐ ┌──┴─┐ ┌──┴─┐ ┌──┴─┐         │
+  │        │GPU0│ │GPU1│ │... │ │GPUn│         │
+  │        └──┬─┘ └──┬─┘ └──┬─┘ └──┬─┘         │
+  │           │      │      │      │  PCIe     │
+  │        ┌──┴─┐ ┌──┴─┐ ┌──┴─┐ ┌──┴─┐         │
+  │        │NIC0│ │NIC1│ │... │ │NICn│         │
+  │        └──┬─┘ └──┬─┘ └──┬─┘ └──┬─┘         │
+  └───────────┼──────┼──────┼──────┼───────────┘
+              ▼      ▼      ▼      ▼               ← 消息语义：RDMA（QP/WQE/CQ）
+  ┌────────────────────────────────────────────┐     每卡每方向 50 GB/s
+  │  scale-out: cluster network (IB / RoCE)    ├──► other NVLink domains
+  └────────────────────────────────────────────┘
+```
+
+同一次"把数据写到另一块 GPU"在两层上的步骤差别（对应下表"访问语义"和"发起者"两行）：
+
+```text
+  scale-up: load/store                scale-out: RDMA
+  ────────────────────────            ─────────────────────────────────────────
+  GPU A kernel                        GPU A kernel / CPU proxy
+    │ st [peer_ptr]                     │ post WQE to QP
+    ▼                                   ▼
+  NVLink / NVSwitch                   NIC A ──► switch network ──► NIC B
+    │                                   │                            │ DMA write
+    ▼                                   │                            ▼
+  GPU B HBM                             │                          GPU B HBM
+                                        ▼
+  sync: flag in memory                CQE on NIC A ──► initiator polls CQ
+
+  左：peer_ptr 是事先映射进本 GPU 地址空间的对端显存，SM 直接写。
+  右：事先注册内存、建 QP；数据由网卡 DMA，完成靠 CQ 通知。
+```
+
 | 维度 | scale-up（NVLink/NVSwitch） | scale-out（RDMA 网卡 + 交换网络） |
 |---|---|---|
 | 访问语义 | 内存映射，SM 直接 load/store 对端显存；也可用 copy engine | 消息/RDMA，需注册内存、QP、提交 WQE、轮询 CQ |
@@ -45,6 +87,23 @@ NVLink 是 GPU 之间（以及 Grace-GPU 之间）的高带宽点对点链路，
   同一快照说明每颗 NVLink Switch 内含 SHARP 引擎，用于网络内归约和 multicast 加速。由表可推每条链路约 50 GB/s 双向（900/18），即每方向约 25 GB/s，与书中"NVSwitch 端口每方向 25 GB/s"一致（推算，非原文）。
 - 演进（6.5.3）：DGX-1 用 NVLink 混合立方体网格（部分 GPU 直连，其余需中转）→ DGX-2 用 16 张 V100 + NVSwitch（把"是否直连"变成"交换层能同时转发多少"）→ DGX A100 八卡 + NVSwitch → GB200 NVL72 机柜级 NVLink。
 - 6.5.5 提到 NVLink 属于缓存一致互联，目录开销随对端数线性增长，把这类互联的规模限制在几十个对端，NVL72 的 72 张 GPU 正处在这个范围（书中观点，与 UB 不维护跨主机一致性对比）。
+
+上面"演进"一条里"是否直连"与"交换层能同时转发多少"的区别，用 4 卡示意（左图只表达"部分直连"，不是 DGX-1 的真实连线）：
+
+```text
+  direct links only (partial mesh)          NVSwitch
+  ┌────┐            ┌────┐                  ┌────┐ ┌────┐ ┌────┐ ┌────┐
+  │GPU0├────────────┤GPU1│                  │GPU0│ │GPU1│ │GPU2│ │GPU3│
+  └─┬──┘            └──┬─┘                  └─┬──┘ └─┬──┘ └─┬──┘ └─┬──┘
+    │                  │                      │      │      │      │
+  ┌─┴──┐            ┌──┴─┐                  ┌─┴──────┴──────┴──────┴─┐
+  │GPU3├────────────┤GPU2│                  │        NVSwitch        │
+  └────┘            └────┘                  └────────────────────────┘
+
+  GPU0 -> GPU2: no direct link,             any pair: GPU -> switch -> GPU
+  relay through GPU1 or GPU3                (all pairs equidistant)
+  (NCCL path type: PATH_NVB)                limit = switch ports / capacity
+```
 
 ### 与 PCIe 对比
 
