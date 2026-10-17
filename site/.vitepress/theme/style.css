@@ -116,6 +116,14 @@
 .vp-doc div[class*="language-"] { border-radius: 6px; border: 1px solid var(--vp-c-divider); }
 .vp-doc div[class*="language-"] code { font-size: 13px; line-height: 1.6; }
 .vp-doc .language-text pre, .vp-doc div[class*="language-"] pre { white-space: pre; overflow-x: auto; }
+/* ASCII 图行距收紧，竖线 │ 上下相接、方框角不断开 */
+.vp-doc div.language-text code { line-height: 1.25; }
+
+/* 手机：ASCII 图字号缩小以少滑动，表头允许换行 */
+@media (max-width: 640px) {
+  .vp-doc div.language-text code { font-size: 11px; }
+  .vp-doc th { white-space: normal; }
+}
 
 /* 公式 */
 .vp-doc mjx-container[display="true"] { overflow-x: auto; overflow-y: hidden; padding: 4px 0; }

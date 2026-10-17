@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **学习站点手机端** — ASCII 图行距收紧到 1.25，竖线与方框角不再断开；屏宽 ≤ 640px 时图的字号降到 11px、表头允许换行（iPhone 13 尺寸下 55 页均无整页横向溢出）。
+
 ### Added
 
 - **RDMA 建链与端到端发包** — `notes/01-rdma/01-verbs-basics.md` 新增 RDMA CM 建链一节（REQ/REP/RTU 时序、CM 事件 / CM 消息 / QP 状态三套状态的对照、RTU 与 RTR/RTS 的区别、与手工建链对比），依据 `third_party/rdma-core/librdmacm/cma.c`；`notes/01-rdma/02-transport-and-ops.md` 新增一次 RDMA WRITE_WITH_IMM 的端到端流程（MR/lkey/rkey、WQE 各段布局、doorbell、组包与 PSN、rkey 校验、CQE owner 位、出错表），依据 mlx5 provider 源码。
