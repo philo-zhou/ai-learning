@@ -49,5 +49,5 @@ python3 -m labs.ccl_sim                     # 不同消息大小下各算法的�
 ## 待深入
 
 - 各外部仓库的固定 commit 以 `docs/references/third-party.md`（及其指向的 `third_party/repos.lock`）为准；本章笔记头部的短 commit 与其一致。
-- 本章 `04-all2all.md` 额外引用了 third_party/DeepEP@93eb6eb 的接口名，DeepEP 的深入导读在 `notes/05-framework-integration/`。
+- 本章 `04-all2all.md` 额外引用了 third_party/DeepEP@b5a33ee 的接口名，DeepEP 的深入导读在 `notes/05-framework-integration/`。
 - 待确认：Double Binary Tree 在 Reduce/Broadcast 重叠（`runTreeSplit`）下的精确代价公式；确认方式：读 `third_party/nccl/src/device/all_reduce.h` 的 `runTreeSplit` 并与 `third_party/nccl/src/tuning/tree.cc` 的带宽系数对照。

@@ -16,7 +16,8 @@
 | `rdma-core/`、`perftest/` | 下层 | Verbs 用户态库与 RDMA 性能测试 |
 | `nccl/`、`nccl-tests/` | 中层 | 集合通信库源码与基准 |
 | `vllm/`、`sglang/` | 上层 | 推理框架的通信调用 |
-| `DeepEP/` | 上层/跨层 | MoE EP All2All 通信库 |
+| `DeepEP/` | 上层/跨层 | MoE EP All2All 通信库（只跟最新主线） |
+| `DeepInfer/` | 上层 | DeepSeek 推理框架，`EPBuffer` 的生产用法 |
 | `Triton-distributed/` | 跨层 | 基于 Triton 的通算融合 |
 
 ## 依赖、数据与外部边界

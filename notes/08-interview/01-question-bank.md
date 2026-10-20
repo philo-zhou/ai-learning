@@ -1,6 +1,6 @@
 # 集合通信库研发面试题库
 
-> 层次：求职 · 来源：third_party/ai-infra-book@3bdcb4fc（第 4、5、6、7、9、10 章）、third_party/nccl@3e46c089、third_party/nccl-tests@afd59aba、third_party/perftest@05200c2f、third_party/rdma-core@bd3282a1、third_party/Triton-distributed@7908e4ea、third_party/DeepEP@93eb6eb2、third_party/vllm@02653fa2、third_party/sglang@d2a43644
+> 层次：求职 · 来源：third_party/ai-infra-book@3bdcb4fc（第 4、5、6、7、9、10 章）、third_party/nccl@3e46c089、third_party/nccl-tests@afd59aba、third_party/perftest@05200c2f、third_party/rdma-core@bd3282a1、third_party/Triton-distributed@7908e4ea、third_party/DeepEP@b5a33eef、third_party/vllm@02653fa2、third_party/sglang@d2a43644
 
 ## 一句话
 

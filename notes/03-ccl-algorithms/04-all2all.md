@@ -1,6 +1,6 @@
 # All2All：算法与 MoE 场景的特殊性
 
-> 层次：中层（连接上层 EP） · 来源：third_party/nccl@3e46c08（`src/enqueue/enqueue.cc`、`src/enqueue/task_prep/task_classify.cc`、`src/init.cc`、`src/ce_coll.cc`、`src/tuning/sym_model/`）、third_party/nccl-tests@afd59ab（`src/alltoall.cu`、`src/alltoallv.cu`、`doc/PERFORMANCE.md`）、third_party/DeepEP@93eb6eb（`deep_ep/buffers/ep.py`）、ai-infra-book@3bdcb4fc 第 6 章 6.2.6、6.4.4 节，第 7 章 7.2.3 节，第 9 章 9.4.1 节
+> 层次：中层（连接上层 EP） · 来源：third_party/nccl@3e46c08（`src/enqueue/enqueue.cc`、`src/enqueue/task_prep/task_classify.cc`、`src/init.cc`、`src/ce_coll.cc`、`src/tuning/sym_model/`）、third_party/nccl-tests@afd59ab（`src/alltoall.cu`、`src/alltoallv.cu`、`doc/PERFORMANCE.md`）、third_party/DeepEP@b5a33ee（`deep_ep/buffers/ep.py`）、ai-infra-book@3bdcb4fc 第 6 章 6.2.6、6.4.4 节，第 7 章 7.2.3 节，第 9 章 9.4.1 节
 
 ## 一句话
 

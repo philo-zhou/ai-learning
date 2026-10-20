@@ -1,6 +1,6 @@
 # 05 上层：框架如何调用通信库
 
-> 层次：上层 · 来源：third_party/vllm@02653fa、third_party/sglang@d2a4364、third_party/DeepEP@93eb6eb、third_party/nccl@3e46c08、third_party/ai-infra-book@3bdcb4fc（第 6、7、9、10 章）
+> 层次：上层 · 来源：third_party/vllm@02653fa、third_party/sglang@d2a4364、third_party/DeepEP@b5a33ee、third_party/nccl@3e46c08、third_party/ai-infra-book@3bdcb4fc（第 6、7、9、10 章）
 
 ## 一句话
 

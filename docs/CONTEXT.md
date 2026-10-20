@@ -80,25 +80,37 @@
 
 - 定义：MoE 专家并行中的两次 All-to-All-v。dispatch 按 top-k 路由把 token 发到专家所在 rank 并按专家排布；combine 把专家输出送回 token 原 rank 并按门控权重求和。
 - 避免：把它当成普通 `ncclAlltoAll`——数据量由每步路由动态决定，且与 token 重排、加权求和融合在同一 kernel。
-- 相关代码或契约：`notes/09-ep-kernels/README.md`、`third_party/DeepEP-hybrid-ep/csrc/kernels/internode_ll.cu`
+- 相关代码或契约：`notes/09-ep-kernels/README.md`、`third_party/DeepEP/deep_ep/include/deep_ep/impls/ep/dispatch.cuh`、`third_party/DeepEP/deep_ep/include/deep_ep/impls/ep/combine.cuh`
 
 ### LL / HT（low-latency / high-throughput）
 
 - 定义：EP 通信的两类 kernel。LL 面向 decode：直连、固定容量缓冲、无 CPU 同步、可 CUDA Graph；HT（DeepEP 叫 normal）面向训练与 prefill：跨节点 RDMA + 节点内 NVLink 分层，追求带宽。
-- 避免：认为 LL 一定"纯 RDMA"——DeepEP LL 在对端可经 NVLink 访问时会直接 store。
-- 相关代码或契约：`notes/09-ep-kernels/02-deepep-low-latency.md`、`third_party/nccl/contrib/nccl_ep/include/ep_enums.h`
+- 避免：认为 LL 一定"纯 RDMA"——DeepEP LL 在对端可经 NVLink 访问时会直接 store。也不要以为 DeepEP V2.5 还有 LL kernel——V2.5 只有一个 `EPBuffer`，按拓扑分 direct / hybrid 模式，decode 用 `do_cpu_sync=False`；LL/HT 之分仍见于 vLLM、SGLang 与 NCCL EP。
+- 相关代码或契约：`notes/09-ep-kernels/05-lineage-and-selection.md`、`notes/09-ep-kernels/03-deepep-v25-direct.md`、`third_party/nccl/contrib/nccl_ep/include/ep_enums.h`、`third_party/DeepEP/deep_ep/include/deep_ep/impls/ep/dispatch.cuh`
 
 ### Hybrid-EP
 
 - 定义：NVIDIA 在 DeepEP `hybrid-ep` 分支实现的高吞吐 EP：先 AllGather 路由并预计算每个 token 的落点，跨节点只发给同 local rank 的 peer，再经 NVLink 扇出，用 TMA warp 专业化流水线降低 SM 占用。
 - 避免：与 DeepEP V2.5 的 `allow_hybrid_mode`（RDMA+NVLink 分层模式）和 NCCL EP 的 `hybrid_ep.cuh`（Hybrid-EP 的 NCCL 移植）混为一谈；三者都指"分层"，但实现不同。
-- 相关代码或契约：`third_party/DeepEP-hybrid-ep/csrc/hybrid_ep/`、`notes/09-ep-kernels/03-hybrid-ep.md`、`notes/09-ep-kernels/04-lineage-and-selection.md`
+- 相关代码或契约：`hybrid-ep@10d4dd73/csrc/hybrid_ep/`（上游分支，未克隆）、`notes/09-ep-kernels/05-lineage-and-selection.md`、`notes/09-ep-kernels/04-deepep-v25-hybrid.md`
+
+### direct / hybrid 模式（DeepEP V2.5）
+
+- 定义：DeepEP V2.5 `EPBuffer` 按拓扑选的两种 kernel。direct 把全部 rank 当一层，每个 (token, 目标 rank) 发一份，发送端 `atomicAdd` 分槽位；hybrid 在多节点时生效，跨节点只经 RDMA 发给目标节点上同 local rank 的 GPU（rail peer / forwarder），再由它经 NVLink 扇出。由 `allow_hybrid_mode`（默认 True）和节点数决定，与 prefill/decode 无关。
+- 避免：把 direct 等同于 V1 LL、把 hybrid 等同于 Hybrid-EP——direct 按 rank 去重并用 barrier 判完成，hybrid 用 channel tail 而非路由预计算。
+- 相关代码或契约：`notes/09-ep-kernels/03-deepep-v25-direct.md`、`notes/09-ep-kernels/04-deepep-v25-hybrid.md`、`third_party/DeepEP/csrc/kernels/comm/context.cpp`（`get_logical_domain_size`）
+
+### do_cpu_sync / deferred epilogue（DeepEP V2.5）
+
+- 定义：`do_cpu_sync=True` 时 CPU 等 GPU 写回接收计数再按精确大小分配输出（训练、prefill）；`False` 时按容量分配、真实数量留在 GPU 上（decode，可 CUDA Graph）。`defer_epilogue=True` 把 CPU 等待、输出分配和按专家展开的 epilogue 推迟到 `EventOverlap.wait()` 时在当前 stream 上执行。
+- 避免：以为 `do_cpu_sync=False` 的输出全部有效——GEMM 必须用 `handle.psum_num_recv_tokens_per_expert` 找有效区间。
+- 相关代码或契约：`notes/09-ep-kernels/02-deepep-v25-overview.md`、`third_party/DeepEP/csrc/buffers/ep.hpp`
 
 ### IBGDA
 
 - 定义：InfiniBand GPUDirect Async，GPU 线程直接在网卡 SQ 中写 WQE、更新 doorbell record 并写 BlueFlame 寄存器发起 RDMA，不经过 CPU。
 - 避免：认为 IBGDA 改变了网卡侧的 RC 协议——网卡看到的 WQE 和门铃与 CPU 发起时相同，变的只是提交者。
-- 相关代码或契约：`third_party/DeepEP-hybrid-ep/csrc/kernels/ibgda_device.cuh`
+- 相关代码或契约：`hybrid-ep@10d4dd73/csrc/kernels/ibgda_device.cuh`（V1，上游分支）；V2.5 经 NCCL GIN 的 GDAKI 后端实现同一能力，见 `third_party/nccl/src/include/nccl_device/gin/gdaki/gin_gdaki.h`
 
 ## 术语关系
 

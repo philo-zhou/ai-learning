@@ -1,6 +1,6 @@
 # 谱系、横向对比与选型
 
-> 层次：中层 · 来源：third_party/DeepEP-hybrid-ep@10d4dd73、third_party/DeepEP@93eb6eb2（V2.5）、third_party/nccl@3e46c089（`contrib/nccl_ep`）、third_party/vllm@02653fa2、third_party/sglang@d2a43644
+> 层次：中层 · 来源：上游 DeepEP `hybrid-ep` 分支@10d4dd73（历史版本，未克隆）、third_party/DeepEP@b5a33eef（V2.5）、third_party/DeepInfer@774ce244、third_party/nccl@3e46c089（`contrib/nccl_ep`）、third_party/vllm@02653fa2、third_party/sglang@d2a43644
 
 ## 一句话
 
@@ -30,11 +30,52 @@ EP 通信库经历了三步：DeepEP V1 用 NVSHMEM 给出 normal（分层、高
      不再提供"零 SM 的 RDMA EP"（README：zero-SM RDMA EP is not supported）
 ```
 
+## V1 与 Hybrid-EP 在 V2.5 中变成了什么
+
+> 依据：`third_party/DeepEP/deep_ep/include/deep_ep/impls/ep/dispatch.cuh`（direct）、`hybrid_dispatch.cuh`（hybrid）、`dispatch_copy_epilogue.cuh`、`combine.cuh`、`hybrid_combine.cuh`，`third_party/DeepEP/csrc/kernels/comm/context.cpp` 的 `get_logical_domain_size`，`third_party/DeepEP/deep_ep/buffers/ep.py`；生产用法对照 `third_party/DeepInfer/deepinfer/model_executor/parallel_utils/userbuffer.py` 与 `third_party/DeepInfer/deepinfer/model_executor/models/v4_modules/mlp.py`。
+
+**一句话**：V2.5 不再按"工况"分 LL / normal 两套 kernel，而是按"**拓扑**"分 direct / hybrid 两种模式，同一个 `EPBuffer.dispatch/combine` 同时服务训练、prefill 和 decode；"decode 低延迟"变成了一个参数 `do_cpu_sync=False`。Hybrid-EP 没有合入主线，主线的 hybrid 模式在结构上更接近 V1 normal（按 channel 推进 + 同号 GPU 转发，但不再是环形队列），但用上了 Hybrid-EP 那一代的 TMA warp 专业化。
+
+### 模式怎么选
+
+`get_logical_domain_size(nccl_comm, allow_hybrid_mode)`：`allow_hybrid_mode=True`（默认）时逻辑域为 `(num_rdma_ranks, num_nvl_ranks)`，多节点走 hybrid；`False` 时为 `(1, 全部 rank)`，所有 rank 都当成一层，走 direct。单节点两者都退化为纯 NVLink。DeepInfer 的 `allocate_ep` 固定 `allow_hybrid_mode=True`，prefill 与 decode 共用一个 `EPBuffer`，只在 `dispatch` 时用 `do_cpu_sync=input_metadata.is_prompt and ...` 区分。
+
+```text
+            V1（已删除）                        V2.5 main（EPBuffer）
+  ┌────────────────────────────────┐            ┌───────────────────────────────────────────────┐
+  │ LL：每 (token,专家) 一次写     │            │ direct（allow_hybrid_mode=False 或单节点）    │
+  │     接收端按专家分区、计数信号 │ ─────────► │   每 (token,目标 rank) 一次写 → copy epilogue │
+  │     recv hook，零 SM 等待      │            │   按专家展开；完成靠全组 barrier              │
+  ├────────────────────────────────┤            ├───────────────────────────────────────────────┤
+  │ normal：RDMA→同号 GPU→NVLink   │            │ hybrid（默认，多节点）                        │
+  │     head/tail 队列 + 5 种 warp │ ─────────► │   rail 上 RDMA 到同号 GPU → forward warp      │
+  │     CPU 等 moe_recv_counter    │            │   经 NVLink TMA 扇出；channel tail 信号       │
+  ├────────────────────────────────┤            ├───────────────────────────────────────────────┤
+  │ Hybrid-EP（hybrid-ep 分支）    │            │ 只保留在 hybrid-ep 分支；NCCL EP 的 HT 模式   │
+  │     AllGather 路由 + scan 落点 │ ─ 未合入 ► │ 是它的移植（contrib/nccl_ep/device/           │
+  │                                │            │ hybrid_ep.cuh）                               │
+  └────────────────────────────────┘            └───────────────────────────────────────────────┘
+  do_cpu_sync=True：CPU 拿精确计数后分配输出（训练 / prefill）
+  do_cpu_sync=False：输出按容量分配，GEMM 用 handle.psum_num_recv_tokens_per_expert 找有效区间（decode，可 CUDA Graph）
+```
+
+### 逐项差异去哪里看
+
+- V1 LL → direct：发送粒度、落点、计数、完成通知、按专家排布、零 SM 等待、combine 回写的逐项对照见 [03 的"和 V1 LL 对照"](03-deepep-v25-direct.md)。
+- V1 normal / Hybrid-EP → hybrid：跨节点与节点内落点、流控、CPU 同步、原路返回、网卡驱动的对照见 [04 的"和前身对照"](04-deepep-v25-hybrid.md)。
+- 两种模式共用的设施（JIT、对称内存、`NCCLGin`、`gpu_barrier`、deferred epilogue）见 [02](02-deepep-v25-overview.md)。
+
+### 面试怎么讲
+
+- "LL 去哪了？"——没有单独的 LL kernel 了。decode 用同一个 dispatch，`do_cpu_sync=False` 保证无 CPU 同步、形状固定、可 CUDA Graph；代价是失去了 recv hook 的零 SM 等待，改用 comm stream + deferred epilogue 做重叠。发送粒度从"每专家"改成"每 rank 去重"：同一 token 的多个专家落在同一 rank 时只传一次。
+- "Hybrid-EP 进主线了吗？"——没有。主线的 hybrid 模式是 DeepSeek 自己基于 V1 normal 思路重写的分层实现，借了 TMA；Hybrid-EP 的"路由预计算"思路被 NCCL EP 的 HT 模式继承。
+- 生产佐证：DeepInfer（DeepSeek 自家推理框架）用的就是 `EPBuffer(allow_hybrid_mode=True)`，prefill `do_cpu_sync=True`、decode `do_cpu_sync=False`，SM 数用 `get_theoretical_num_sms` 估算后再给计算留至少 `min(32, SM 总数/4)` 个。
+
 ## 名字辨析："hybrid" 指三种不同的东西
 
 | 叫法 | 所指 | 位置 |
 |---|---|---|
-| **Hybrid-EP** | NVIDIA 写的整套高吞吐实现（本章 [03](03-hybrid-ep.md)） | `third_party/DeepEP-hybrid-ep/csrc/hybrid_ep/`，上游 `hybrid-ep` 分支；V2.5 README 的致谢列表也链接到这个分支 |
+| **Hybrid-EP** | NVIDIA 写的整套高吞吐实现（本仓库不再克隆，2026-10-20 前的笔记已移除） | `hybrid-ep@10d4dd73/csrc/hybrid_ep/`，上游 `hybrid-ep` 分支；V2.5 README 的致谢列表也链接到这个分支 |
 | **NCCL EP 的 hybrid_ep** | Hybrid-EP 在 NCCL GIN/LSA 上的移植，对应 NCCL EP 的 `NCCL_EP_ALGO_HIGH_THROUGHPUT` | `third_party/nccl/contrib/nccl_ep/device/hybrid_ep.cuh`、`include/ep_enums.h` |
 | **DeepEP V2.5 的 hybrid mode** | `EPBuffer(allow_hybrid_mode=True)`：多节点时用"RDMA + NVLink 分层"而不是 direct；docstring 说它带宽更高、对多平面/多 rail 网络更友好 | `third_party/DeepEP/deep_ep/buffers/ep.py`、`third_party/DeepEP/deep_ep/include/deep_ep/impls/ep/hybrid_dispatch.cuh` |
 
@@ -46,7 +87,7 @@ EP 通信库经历了三步：DeepEP V1 用 NVSHMEM 给出 normal（分层、高
 |---|---|---|---|---|---|
 | 目标工况 | 训练、prefill | decode | 训练、prefill | decode / 训练与 prefill | 统一接口，覆盖两者 |
 | 拓扑 | 分层（RDMA→同号 GPU→NVLink） | 直连（节点内可走 NVLink 旁路） | 分层（同 V1 normal） | LL 直连 / HT 分层 | direct 或 hybrid |
-| 落点决定 | notify 交换计数，接收端分配 | 发送端本地 `atomicAdd` 槽位 | 全局路由 AllGather + scan | LL 同 V1 LL / HT 同 Hybrid-EP | 待确认（见 V2.5 `dispatch.cuh`/`hybrid_dispatch.cuh` 中的 rank 去重与 slot 分配） |
+| 落点决定 | notify 交换计数，接收端分配 | 发送端本地 `atomicAdd` 槽位 | 全局路由 AllGather + scan | LL 同 V1 LL / HT 同 Hybrid-EP | direct：发送端按目标 rank `atomicAdd`；hybrid：channel 私有 tail + forwarder `atomicAdd`（见上节） |
 | 去重 | 按节点、按 rank | 不去重（每个专家一份） | 跨节点按节点、节点内按 rank | 同对应原版 | 有 rank 级去重（源码注释 "Rank choice should do deduplication"） |
 | CPU 同步 | 有（等 `moe_recv_counter`） | 无 | 默认有（拿精确计数）；`non_blocking` 时无 | 视模式 | `do_cpu_sync` 可选 |
 | CUDA Graph | 不兼容（单节点 `num_worst_tokens` 例外） | 兼容 | `non_blocking` 时兼容 | 兼容 | `do_cpu_sync=False` 时兼容 |
@@ -95,5 +136,4 @@ PD 分离部署下，prefill 实例用高吞吐 kernel、decode 实例用 LL，�
 
 ## 待深入
 
-- 待确认：DeepEP V2.5 `hybrid_dispatch.cuh` 中 scale-out 与 scale-up 两级之间的 slot 分配与 channel linked list 机制；确认方式：精读 `third_party/DeepEP/deep_ep/include/deep_ep/impls/ep/hybrid_dispatch.cuh` 和 `deep_ep/buffers/ep.py` 中 `token_metadata_at_forward`、`channel_linked_list` 的说明。
 - 待确认：NCCL EP 的 SM 占用与 V1/Hybrid-EP 的同平台对比；确认方式：在 GPU 环境运行 `third_party/nccl/contrib/nccl_ep/ep_bench.cu` 与 DeepEP 自带测试。

@@ -1,6 +1,6 @@
 # 通算融合算子设计检查清单
 
-> 层次：跨层 · 来源：third_party/Triton-distributed@7908e4ea、third_party/DeepEP@93eb6eb2、third_party/nccl@3e46c089、ai-infra-book 第 5.5.4、6.4.3、6.4.4、9.4.3、10.3.3 节
+> 层次：跨层 · 来源：third_party/Triton-distributed@7908e4ea、third_party/DeepEP@b5a33eef、third_party/nccl@3e46c089、ai-infra-book 第 5.5.4、6.4.3、6.4.4、9.4.3、10.3.3 节
 >
 > 本文是方法清单，具体条目都落到前三篇已导读的代码上；凡属一般工程经验而非本地源码证据的，会注明"经验"。
 

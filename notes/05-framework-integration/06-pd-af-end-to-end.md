@@ -1,6 +1,6 @@
 # 一次完整推理：PD 分离 + AF 分离
 
-> 层次：上层 · 来源：third_party/vllm@02653fa、third_party/sglang@d2a4364、third_party/DeepEP@93eb6eb、third_party/ai-infra-book@3bdcb4fc 第 7、9 章；外部结论引用 [调研报告](../../docs/references/2026-10-14-inference-parallelism-ep-research.md) 的 F2、F13、G4，以及 [MegaScale-Infer 阶段调研](../../docs/references/2026-10-17-megascale-infer-phase.md)
+> 层次：上层 · 来源：third_party/vllm@02653fa、third_party/sglang@d2a4364、third_party/DeepEP@b5a33ee、third_party/ai-infra-book@3bdcb4fc 第 7、9 章；外部结论引用 [调研报告](../../docs/references/2026-10-14-inference-parallelism-ep-research.md) 的 F2、F13、G4，以及 [MegaScale-Infer 阶段调研](../../docs/references/2026-10-17-megascale-infer-phase.md)
 
 ## 一句话
 

@@ -1,6 +1,6 @@
 # 从这里开始：从大模型推理出发，看懂并行、通信与 EP
 
-> 层次：总览（贯穿上中下三层） · 来源：[调研报告](../../docs/references/2026-10-14-inference-parallelism-ep-research.md)（2026-10-14，外部来源编号记为 S1~S17）、third_party/ai-infra-book@3bdcb4fc（§6、§7.2.3、§9.4）、third_party/nccl@3e46c089、third_party/vllm@02653fa2、third_party/sglang@d2a43644、third_party/DeepEP@93eb6eb2、third_party/DeepEP-hybrid-ep@10d4dd73
+> 层次：总览（贯穿上中下三层） · 来源：[调研报告](../../docs/references/2026-10-14-inference-parallelism-ep-research.md)（2026-10-14，外部来源编号记为 S1~S17）、third_party/ai-infra-book@3bdcb4fc（§6、§7.2.3、§9.4）、third_party/nccl@3e46c089、third_party/vllm@02653fa2、third_party/sglang@d2a43644、third_party/DeepEP@b5a33eef、上游 DeepEP `hybrid-ep` 分支@10d4dd73（历史版本，未克隆）
 
 ## 一句话
 
@@ -156,9 +156,9 @@ two micro-batches (0 / 1)
 | 方案 | 发起方 | 跨节点如何驱动网卡 | 节点内 | 定位与要点 | 证据 |
 |---|---|---|---|---|---|
 | NCCL `ncclAlltoAll` / AG+RS 回退 | host | NCCL proxy 线程 | NVLink P2P | 通用、易用；动态不均匀 + 小消息时开销大。vLLM 默认 `allgather_reducescatter` | [F8]；`third_party/vllm/vllm/config/parallel.py` |
-| **DeepEP V1** | GPU | NVSHMEM + IBGDA（GPU 直接驱动网卡） | NVLink | 事实标准：normal 与 LL 两种 kernel，奠定 dispatch/combine 接口；只能跑在 NVIDIA GPU + 网卡组合上 | [S2]；V1 源码 `third_party/DeepEP-hybrid-ep/csrc/kernels/internode_ll.cu`，详见 [09/02](../09-ep-kernels/02-deepep-low-latency.md) |
-| **Hybrid-EP**（NVIDIA，DeepEP `hybrid-ep` 分支） | GPU | DOCA GPUNetIO（或 NIXL） | NVLink（TMA） | 训练/prefill 用：路由 AllGather 预计算落点，跨节点只发同号 GPU，TMA warp 专业化流水，4~16 个 SM | `third_party/DeepEP-hybrid-ep/csrc/hybrid_ep/`；[09/03](../09-ep-kernels/03-hybrid-ep.md) |
-| **DeepEP V2.x** | GPU | NCCL GIN（GDAKI，或 Proxy 后端） | NCCL LSA | 移除 NVSHMEM，改建在 NCCL device API 上 | [F10]；`third_party/DeepEP/README.md`、`third_party/DeepEP/csrc/kernels/comm/context.cpp` |
+| **DeepEP V1** | GPU | NVSHMEM + IBGDA（GPU 直接驱动网卡） | NVLink | 事实标准：normal 与 LL 两种 kernel，奠定 dispatch/combine 接口；只能跑在 NVIDIA GPU + 网卡组合上 | [S2]；V1 源码 `hybrid-ep@10d4dd73/csrc/kernels/internode_ll.cu`（上游分支，未克隆）；与 V2.5 的对照见 [09/05](../09-ep-kernels/05-lineage-and-selection.md) |
+| **Hybrid-EP**（NVIDIA，DeepEP `hybrid-ep` 分支） | GPU | DOCA GPUNetIO（或 NIXL） | NVLink（TMA） | 训练/prefill 用：路由 AllGather 预计算落点，跨节点只发同号 GPU，TMA warp 专业化流水，4~16 个 SM | `hybrid-ep@10d4dd73/csrc/hybrid_ep/`（上游分支，未克隆）；[09/05](../09-ep-kernels/05-lineage-and-selection.md) |
+| **DeepEP V2.x** | GPU | NCCL GIN（GDAKI，或 Proxy 后端） | NCCL LSA | 移除 NVSHMEM，改建在 NCCL device API 上；一个 `EPBuffer` 按拓扑分 direct / hybrid，decode 用 `do_cpu_sync=False` | [F10]；`third_party/DeepEP/README.md`、`third_party/DeepEP/csrc/kernels/comm/context.cpp`；源码精读 [09/02~04](../09-ep-kernels/02-deepep-v25-overview.md) |
 | **NCCL EP** | GPU | GIN put/signal | LSA | NCCL 官方的 MoE 扩展，有 LL 与 HT 两种模式（对标 DeepEP）；需 NCCL 2.29+、CUDA 13+ | [F11]；`third_party/nccl/contrib/nccl_ep/device/ll_ep.cuh`、`hybrid_ep.cuh` |
 | **pplx-kernels → pplx-garden** | GPU | 旧版：NVSHMEM（IBGDA/IBRC）；新版：fabric-lib RDMA P2P | NVLink | Perplexity 方案，旧 kernel 已弃用；新版支持 AWS EFA | [G1][G2] |
 | **UCCL-EP** | GPU 发命令 | **CPU proxy 线程调用 libibverbs** | NVLink | 厂商中立：可跑在 EFA、Broadcom、AMD Pensando 等网卡上；每通道一个 QP；在 GH200 上反超 DeepEP | [G3] |
@@ -201,7 +201,7 @@ two micro-batches (0 / 1)
 | 这些通信用什么算法最快？ | 中层 [03-ccl-algorithms](../03-ccl-algorithms/README.md) | [α-β 模型](../03-ccl-algorithms/02-alpha-beta-model.md)、[All2All](../03-ccl-algorithms/04-all2all.md)、`labs/ccl_sim` |
 | NCCL 怎么把算法落到硬件？ | 中层 [04-nccl-internals](../04-nccl-internals/README.md) | channel / 协议 / proxy / net plugin |
 | EP 专用库为什么存在、往哪走？ | 上层与跨层 [05](../05-framework-integration/04-deepep.md)、[06](../06-comm-compute-fusion/03-nvshmem-and-device-initiated.md) | DeepEP、NCCL EP、GIN |
-| EP 的 dispatch/combine 在 kernel 里怎么做？ | 中层 [09-ep-kernels](../09-ep-kernels/README.md) | DeepEP LL、Hybrid-EP、谱系与选型 |
+| EP 的 dispatch/combine 在 kernel 里怎么做？ | 中层 [09-ep-kernels](../09-ep-kernels/README.md) | DeepEP V2.5 总览、direct、hybrid，谱系与选型 |
 | 通信怎么和计算融合？ | 跨层 [06-comm-compute-fusion](../06-comm-compute-fusion/README.md) | 重叠分类、Triton-distributed、设计清单 |
 | 节点内靠什么？ | 下层 [02-scale-up](../02-scale-up/README.md) | NVLink/NVSwitch、P2P/SHM/NVLS |
 | 节点间靠什么？ | 下层 [01-rdma](../01-rdma/README.md) | Verbs/QP、RoCEv2 拥塞控制、GPUDirect、NCCL IB |
@@ -212,7 +212,7 @@ two micro-batches (0 / 1)
 
 1. **本页 → [并行与通信模式](../05-framework-integration/01-parallelism-and-comm-patterns.md)**：能说清第 2 节总表的每一行。
 2. **[集合原语](../03-ccl-algorithms/01-primitives.md) → [α-β 模型](../03-ccl-algorithms/02-alpha-beta-model.md)**：跑 `python3 -m labs.ccl_sim`，能解释 decode 小消息为何选择低延迟算法。
-3. **[All2All](../03-ccl-algorithms/04-all2all.md) → [DeepEP](../05-framework-integration/04-deepep.md) → [EP kernel 专章](../09-ep-kernels/README.md)**：能写出第 3.2 节的公式，讲清第 3.3 节的五点不同；再讲清 LL 的"固定槽位 + 同 QP 计数"与 Hybrid-EP 的"路由预计算 + 分层"。
+3. **[All2All](../03-ccl-algorithms/04-all2all.md) → [DeepEP](../05-framework-integration/04-deepep.md) → [EP kernel 专章](../09-ep-kernels/README.md)**：能写出第 3.2 节的公式，讲清第 3.3 节的五点不同；再讲清 DeepEP V2.5 direct 的"发送端分槽位 + 计数并行交换 + barrier 完成"与 hybrid 的"rail 上 RDMA + forward warp 扇出 + linked list 原路返回"。
 4. **[vLLM 通信层](../05-framework-integration/02-vllm-communication.md)**：对照 `third_party/vllm/vllm/distributed/device_communicators/all2all.py`，看后端怎样被选中。
 5. **[device-initiated 通信](../06-comm-compute-fusion/03-nvshmem-and-device-initiated.md)**：读 `third_party/nccl/contrib/nccl_ep/README.md`，理解 GIN 的 GDAKI 与 Proxy 两个后端。
 6. **下沉到 [RDMA](../01-rdma/README.md) 与 [scale-up](../02-scale-up/README.md)**：理解 GDAKI 为什么要求 GPU 能直接写网卡门铃，CPU proxy 又多付出了什么。

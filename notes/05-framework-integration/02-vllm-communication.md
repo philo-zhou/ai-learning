@@ -230,7 +230,7 @@ kernel：`third_party/vllm/csrc/custom_all_reduce.cuh`
 - pynccl 与 `torch.distributed` 的 NCCL 是两个独立 communicator（不同 `ncclComm_t`），两者都会占用 NCCL 资源（channel buffer、proxy 线程）；`VLLM_NCCL_SO_PATH` 指定的库与 PyTorch 自带 NCCL 版本可能不同，排障时要确认实际加载的是哪一个。
 - 多实例 DP + EP 时 `init_distributed_environment` 会重写 rank/world size，日志里的 rank 与单实例语义不同。
 - NCCL symm mem 依赖 `ncclMemAlloc` 分配的内存和窗口注册，普通 `cudaMalloc` 张量需要 `all_reduce_symmetric_with_copy` 先拷贝。
-- DeepEP 版本：vLLM 同时调用 V1 风格 `deep_ep.Buffer` / `low_latency_dispatch` 和 V2 的 `deep_ep.ElasticBuffer`；而本地 `third_party/DeepEP@93eb6eb` 已是 V2.5（`EPBuffer`），API 不匹配（见 [04](04-deepep.md)）。
+- DeepEP 版本：vLLM 同时调用 V1 风格 `deep_ep.Buffer` / `low_latency_dispatch` 和 V2 的 `deep_ep.ElasticBuffer`；而本地 `third_party/DeepEP@b5a33ee` 已是 V2.5（`EPBuffer`），API 不匹配（见 [04](04-deepep.md)）。
 
 ## 面试自测
 

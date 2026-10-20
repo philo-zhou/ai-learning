@@ -6,6 +6,8 @@
 
 ### Changed
 
+- **EP kernel 专章改为 DeepEP V2.5 源码精读** — `notes/09-ep-kernels/`：新增 `02-deepep-v25-overview.md`（一次 dispatch 从 Python 到 kernel：JIT 模板实参、对称内存与 GIN、token 布局、workspace 信号、`NCCLGin`、`gpu_barrier`、deferred epilogue、SM/QP 解析估算）、`03-deepep-v25-direct.md`（notify 与数据并行、发送端分槽位、copy epilogue 展开、combine 的 min(R,k) 行与本地归约）、`04-deepep-v25-hybrid.md`（channel 与 rail、两级 notify、scale-out tail、forward warp、linked list、三级归约）；删除旧的 V1 LL 与 Hybrid-EP 两篇，谱系篇改名为 `05-lineage-and-selection.md`，设计空间篇补 V2.5 做法；术语表新增 direct / hybrid 模式、do_cpu_sync / deferred epilogue。
+- **DeepEP 只跟最新主线、新增 DeepInfer** — `third_party/repos.lock`：DeepEP 升到 `b5a33eef`，删除 `DeepEP-hybrid-ep`（V1 / Hybrid-EP 历史分支），新增 DeepSeek 推理框架 `DeepInfer@774ce244`。`notes/09-ep-kernels/04-lineage-and-selection.md` 新增"V1 与 Hybrid-EP 在 V2.5 中变成了什么"：LL → direct 模式 + `do_cpu_sync=False`，normal → hybrid 模式，Hybrid-EP 未合入主线；原引用该分支的笔记改为 `hybrid-ep@10d4dd73/<路径>` 历史标注。
 - **学习站点手机端** — ASCII 图行距收紧到 1.25，竖线与方框角不再断开；屏宽 ≤ 640px 时图的字号降到 11px、表头允许换行（iPhone 13 尺寸下 55 页均无整页横向溢出）。
 
 ### Added

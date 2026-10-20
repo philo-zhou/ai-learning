@@ -1,6 +1,6 @@
 # NVSHMEM 与 device-initiated 通信
 
-> 层次：跨层（偏中层） · 来源：third_party/Triton-distributed@7908e4ea、third_party/DeepEP@93eb6eb2、third_party/nccl@3e46c089、ai-infra-book 第 6.4.4、7.3.2 节
+> 层次：跨层（偏中层） · 来源：third_party/Triton-distributed@7908e4ea、third_party/DeepEP@b5a33eef、third_party/nccl@3e46c089、ai-infra-book 第 6.4.4、7.3.2 节
 >
 > 边界说明：NVSHMEM 本身的源码未克隆。"NVSHMEM 概念"一节里凡不是来自本地仓库文字的，都标为"通用知识"，需要时再用 NVSHMEM 官方文档核实。
 
@@ -92,7 +92,7 @@ IBGDA / GDAKI: GPU 线程构造 WQE 并直接敲 NIC doorbell
 
 ### 4. DeepEP 如何做 device-initiated 通信（以本地 commit 为准）
 
-**重要：这与旧版认知不同。** 本地克隆的 DeepEP@93eb6eb2（V2.5）README 明确写："Fully remove V1, including its APIs, NVSHMEM backend ... NVSHMEM is no longer a dependency"。因此不能再说"DeepEP 基于 NVSHMEM"。事实（以本地代码为准）：
+**重要：这与旧版认知不同。** 本地克隆的 DeepEP@b5a33eef（V2.5）README 明确写："Fully remove V1, including its APIs, NVSHMEM backend ... NVSHMEM is no longer a dependency"。因此不能再说"DeepEP 基于 NVSHMEM"。事实（以本地代码为准）：
 
 - 通信后端是 NCCL 的 device API：`third_party/DeepEP/csrc/kernels/comm/context.cpp` 通过 `ncclCommQueryProperties` 查询能力，用 `ncclDevCommCreate` 创建 device communicator，`reqs.ginType = NCCL_GIN_TYPE_GDAKI`，并设置 GIN 上下文数（`ginContextCount`，等于分配的 QP 数）、队列深度、signal 数、连接类型（`NCCL_GIN_CONNECTION_FULL` / `RAIL` / `CUSTOM_STRIDE`）；用 `ncclCommWindowRegister(..., NCCL_WIN_STRICT_ORDERING)` 把对称内存注册为窗口；`EP_DISABLE_GIN=1` 可关闭 GIN。内存用 `ncclMemAlloc` 分配（`csrc/kernels/comm/symmetric.hpp`）。
 - kernel：`csrc/kernels/ep/dispatch.hpp`、`combine.hpp` 在宿主侧封装；设备侧实现在 `deep_ep/include/deep_ep/impls/ep/`（`dispatch.cuh`、`combine.cuh`、`hybrid_dispatch.cuh`、`hybrid_combine.cuh`）。`hybrid_dispatch.cuh` 里节点内用 TMA store 写（`ptx::tma_store_1d`），跨节点用 `gin.put<ncclTeamTagRail>(...)`，源码注释写 "Issue IBGDA requests"，说明 GDAKI 这条路径在代码里仍被称作 IBGDA。

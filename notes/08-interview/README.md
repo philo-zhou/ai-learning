@@ -1,6 +1,6 @@
 # 08 面试准备
 
-> 层次：求职 · 来源：third_party/ai-infra-book@3bdcb4fc、third_party/nccl@3e46c089、third_party/nccl-tests@afd59aba、third_party/rdma-core@bd3282a1、third_party/Triton-distributed@7908e4ea、third_party/DeepEP@93eb6eb2、third_party/vllm@02653fa2
+> 层次：求职 · 来源：third_party/ai-infra-book@3bdcb4fc、third_party/nccl@3e46c089、third_party/nccl-tests@afd59aba、third_party/rdma-core@bd3282a1、third_party/Triton-distributed@7908e4ea、third_party/DeepEP@b5a33eef、third_party/vllm@02653fa2
 
 ## 一句话
 

@@ -1,6 +1,6 @@
 # torch.distributed 与 ProcessGroupNCCL（概念）
 
-> 层次：上层 · 来源：PyTorch 源码**未克隆**（C++ 部分全部待确认）；Python 前端引用 ai-infra-book@3bdcb4fc 内附的 torch 2.14.0 快照 `third_party/ai-infra-book/experiments/ch07/07-08/framework-sources/distributed_c10d.py` 与 `distributed.py`（来源与 torch git commit 见同目录 `framework.json`）；third_party/vllm@02653fa、third_party/DeepEP@93eb6eb 作调用佐证
+> 层次：上层 · 来源：PyTorch 源码**未克隆**（C++ 部分全部待确认）；Python 前端引用 ai-infra-book@3bdcb4fc 内附的 torch 2.14.0 快照 `third_party/ai-infra-book/experiments/ch07/07-08/framework-sources/distributed_c10d.py` 与 `distributed.py`（来源与 torch git commit 见同目录 `framework.json`）；third_party/vllm@02653fa、third_party/DeepEP@b5a33ee 作调用佐证
 
 ## 一句话
 

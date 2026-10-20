@@ -1,6 +1,6 @@
 # 06 通算融合（Communication-Computation Fusion）
 
-> 层次：跨层 · 来源：third_party/Triton-distributed@7908e4ea、third_party/DeepEP@93eb6eb2、third_party/nccl@3e46c089、third_party/ai-infra-book@3bdcb4fc（第 5.5.4、6.4.3、6.4.4、7.3.2、9.4.3、10.3.3 节）
+> 层次：跨层 · 来源：third_party/Triton-distributed@7908e4ea、third_party/DeepEP@b5a33eef、third_party/nccl@3e46c089、third_party/ai-infra-book@3bdcb4fc（第 5.5.4、6.4.3、6.4.4、7.3.2、9.4.3、10.3.3 节）
 
 ## 一句话
 

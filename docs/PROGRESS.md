@@ -1,14 +1,14 @@
 # 当前进度
 
-- 最后更新：2026-10-17 CST
+- 最后更新：2026-10-21 CST
 - 当前分支：`main`
 - 基线提交：本轮成果即首个提交（用 `git log -1` 查看）；远程 `origin` = https://github.com/philo-zhou/ai-learning（用户 2026-10-14 授权推送）
 - 工作树状态：提交后为 clean；`third_party/*/` 被 `.gitignore` 排除
 
 ## 可核实基线
 
-- 10 个外部资料按 `third_party/repos.lock` 固定版本拉取完毕（2026-10-15 新增 `DeepEP-hybrid-ep`），且均无本地改动 — 证据：`bash scripts/fetch_third_party.sh check` 全部 OK；逐个 `git -C third_party/<repo> status --porcelain` 为空。
-- `notes/00~09` 十个章节共 49 篇笔记（2026-10-15 新增 `notes/09-ep-kernels/` 五篇；2026-10-17 新增 `05-framework-integration/06-pd-af-end-to-end.md`）；学习入口 `notes/00-roadmap/00-start-here.md`，章节索引 `notes/00-roadmap/README.md`。
+- 10 个外部资料按 `third_party/repos.lock` 固定版本拉取完毕（2026-10-20：DeepEP 升到最新主线 `b5a33eef`，移除 `DeepEP-hybrid-ep`，新增 `DeepInfer`），且均无本地改动 — 证据：`bash scripts/fetch_third_party.sh check` 全部 OK；逐个 `git -C third_party/<repo> status --porcelain` 为空。
+- `notes/00~09` 十个章节共 50 篇笔记（2026-10-15 新增 `notes/09-ep-kernels/` 五篇；2026-10-17 新增 `05-framework-integration/06-pd-af-end-to-end.md`；2026-10-21 09 章改为 DeepEP V2.5 精读，共六篇）；学习入口 `notes/00-roadmap/00-start-here.md`，章节索引 `notes/00-roadmap/README.md`。
 - 推理并行与 EP 通信调研：`docs/references/2026-10-14-inference-parallelism-ep-research.md`（17 个来源，13 条结论经过验证）。
 - `labs/ccl_sim` 算法模拟器与 α-β 代价模型（含 Full-mesh），36 个单元测试。
 - 治理入口：`AGENTS.md`（`CLAUDE.md`、`CODEBUDDY.md` 软链接）、`docs/`、`scripts/check_repo.py`、`scripts/fetch_third_party.sh`。
@@ -19,6 +19,8 @@
 
 ## 本轮完成并验证
 
+- 2026-10-21：`notes/09-ep-kernels/` 改为 DeepEP V2.5 源码精读：新增 `02-deepep-v25-overview.md`（调用链、JIT、对称内存与 GIN、token 布局、workspace、`NCCLGin`、`gpu_barrier`、deferred epilogue、SM/QP 估算）、`03-deepep-v25-direct.md`、`04-deepep-v25-hybrid.md`；删除基于上游 `hybrid-ep` 分支的旧 02（V1 LL）、03（Hybrid-EP）；谱系篇改名为 `05-lineage-and-selection.md`；`01-design-space.md` 每个决定补 V2.5 做法。所有 V2.5 结论对照 `third_party/DeepEP@b5a33eef` 逐文件阅读，GIN 批量门铃与信号强弱对照 `third_party/nccl@3e46c089` 核实；kernel 行为未实测（not-run） — 证据：`python3 scripts/check_repo.py`、`cd site && npm run build`。
+- 2026-10-20：DeepEP 只保留最新主线（`93eb6eb2` → `b5a33eef`，两者只差 lint 配置文件，代码相同），移除 `hybrid-ep` 分支克隆；新增 DeepSeek 推理框架 `DeepInfer@774ce244`。`notes/09-ep-kernels/04-lineage-and-selection.md`（2026-10-21 改名为 `05-lineage-and-selection.md`）新增"V1 与 Hybrid-EP 在 V2.5 中变成了什么"（对照 `dispatch.cuh`、`hybrid_dispatch.cuh` 与 DeepInfer 的 `EPBuffer` 用法），解决原"V2.5 slot 分配"待确认；09 章与其他笔记中对 `hybrid-ep` 分支的引用改为 `hybrid-ep@10d4dd73/<路径>` 历史标注 — 证据：`bash scripts/fetch_third_party.sh` 全部 OK；`python3 scripts/check_repo.py`；`cd site && npm run build`。
 - 2026-10-17：`notes/01-rdma/01-verbs-basics.md` 补 RDMA CM 建链，`02-transport-and-ops.md` 补端到端 WRITE_WITH_IMM 流程；用户态部分对照 `librdmacm/cma.c`、`providers/mlx5/{qp.c,cq.c,mlx5dv.h}` 核实，网卡内部行为与 CM 消息格式按 IB 规范描述（内核 `ib_cm` 未克隆，列为待确认）— 证据：`python3 scripts/check_repo.py docs`、`cd site && npm run build`。
 - 2026-10-17：`notes/01-rdma/03-roce-ib-congestion.md` 补充 RoCE 优先级与网卡 QoS 配置，解决原笔记中 TC→DSCP 映射、ECN sysfs 路径两项待确认；数值依据 `docs/references/2026-10-17-roce-qos-config.md`，网卡 CNP 默认值等仍待真机确认 — 证据：`python3 scripts/check_repo.py docs`。
 - 2026-10-17：给 `notes/` 下 49 篇笔记补充 ASCII 示意图（按章节由并行 Agent 完成，只增不删；源码细节对照本地克隆核实）；`notes/06-comm-compute-fusion/` 5 篇（13 张图）在中断后补完，图中标识符（`symm_workspaces`、`rowise_ag_gemm_dispatcher`、GIN 强/弱信号等）已对照 `third_party/Triton-distributed`、`third_party/nccl` 核实— 证据：`python3 scripts/check_repo.py docs` 与 `cd site && npm run build` 均 passed；中文与右边框对齐用脚本按显示宽度扫描。
@@ -40,8 +42,8 @@
 | not-run | nccl-tests、perftest、vLLM/SGLang/DeepEP/Triton-distributed 示例 | GPU/RDMA 实验 | 本机无 GPU 与 RDMA 网卡 |
 | passed | deep-research 工作流 | 推理并行与 EP 调研 | 102 个 agent 无错误；25 条结论经 3 票验证，24 条确认、1 条推翻 |
 | passed | `cd site && npm run build` | 学习站点 | 52 个页面，无死链，`site verify: passed`（Node v24，VitePress 1.6.4，2026-10-15） |
-| passed | `bash scripts/fetch_third_party.sh` | 新增 DeepEP-hybrid-ep | `CLONE` 后 `OK DeepEP-hybrid-ep 10d4dd73`，其余 9 个 OK（2026-10-15） |
-| not-run | `tests/test_low_latency.py`、`tests/test_hybrid_ep.py`（DeepEP-hybrid-ep） | EP kernel 实测 | 需要 Hopper/Blackwell 多卡 + IB/RoCE |
+| passed | `bash scripts/fetch_third_party.sh` | DeepEP 升级、新增 DeepInfer | `CLONE` 后 `OK DeepEP b5a33eef`、`OK DeepInfer 774ce244`，其余 8 个 OK（2026-10-20） |
+| not-run | `third_party/DeepEP/tests/ep/test_ep.py`、DeepInfer `examples/offline_inference.py` | EP kernel 与推理实测 | 需要 Hopper/Blackwell 多卡 + IB/RoCE；DeepInfer 需 SM100 |
 | partial | 笔记技术内容 | `notes/` | 由并行 Agent 依据本地源码撰写，只有路径经机械核对；函数名、结论需阅读时抽查 |
 
 ## 阻塞、授权与恢复条件

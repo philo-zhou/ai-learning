@@ -24,7 +24,7 @@
         │ 调用
 中层  03-ccl-algorithms          Ring / Tree / Halving-Doubling / All2All + α-β 模型
        04-nccl-internals          NCCL：bootstrap、拓扑、channel、协议、proxy、net plugin
-       09-ep-kernels              EP 专用库：DeepEP LL / Hybrid-EP / NCCL EP 的 dispatch/combine kernel
+       09-ep-kernels              EP 专用库：DeepEP V2.5 direct / hybrid 的 dispatch/combine kernel，谱系对照 V1、Hybrid-EP、NCCL EP
         │ 调用
 下层  02-scale-up                NVLink / NVSwitch / NVLS（P2P、SHM transport）
        01-rdma                    Verbs、RoCEv2/IB、拥塞控制、GPUDirect RDMA

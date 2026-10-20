@@ -1,10 +1,12 @@
 # EP All2All 的设计空间：五个必须做的决定
 
-> 层次：中层 · 来源：third_party/DeepEP-hybrid-ep@10d4dd73、third_party/DeepEP@93eb6eb2、third_party/nccl@3e46c089（`contrib/nccl_ep`）、ai-infra-book 第 7、9 章
+> 层次：中层 · 来源：上游 DeepEP `hybrid-ep` 分支@10d4dd73（历史版本，未克隆）、third_party/DeepEP@b5a33eef、third_party/nccl@3e46c089（`contrib/nccl_ep`）、ai-infra-book 第 7、9 章
+
+> **版本说明（2026-10-20）**：本仓库只克隆 DeepEP 最新主线（V2.5，`third_party/DeepEP`），V1 LL、V1 normal 与 Hybrid-EP 的源码只存在于上游 `hybrid-ep` 分支 [@10d4dd73](https://github.com/deepseek-ai/DeepEP/tree/10d4dd7377d5bce900fbb4b80cce863764892b95)，本地不再克隆。文中 `hybrid-ep@10d4dd73/<路径>` 指该分支上的文件，撰写时已对照源码核实，本地已无法复核。每个决定下都补了 V2.5 的做法（本地源码可复核），V2.5 精读见 [02](02-deepep-v25-overview.md)、[03](03-deepep-v25-direct.md)、[04](04-deepep-v25-hybrid.md)。
 
 ## 一句话
 
-任何 EP dispatch/combine 实现都要回答五个问题：**落点由谁决定、完成怎么通知、缓冲区按什么上界分配、走直连还是分层、用多少 SM 搬数据**。DeepEP LL 和 Hybrid-EP 是这五个问题的两组典型答案。
+任何 EP dispatch/combine 实现都要回答五个问题：**落点由谁决定、完成怎么通知、缓冲区按什么上界分配、走直连还是分层、用多少 SM 搬数据**。DeepEP V1 LL 和 Hybrid-EP 是这五个问题的两组典型答案，DeepEP V2.5 的 direct / hybrid 是第三组。
 
 ## 在调用链中的位置
 
@@ -26,9 +28,11 @@ GPU 直驱网卡（NVSHMEM IBGDA / DOCA GPUNetIO / NCCL GIN）+ NVLink load/stor
 
 | 做法 | 谁定落点 | 代表 | 代价 |
 |---|---|---|---|
-| **发送端本地原子分配**：发送端对"目标专家"计数器 `atomicAdd`，得到在该专家、该源 rank 分区里的槽位号 | 发送端 | DeepEP LL：`atomicAdd(atomic_counter_per_expert + dst_expert_idx, 1)`（`third_party/DeepEP-hybrid-ep/csrc/kernels/internode_ll.cu` dispatch 发送段） | 每个 (专家, 源 rank) 都要预留最大容量；接收端拿到的是"分区 + 计数"，要再整理 |
+| **发送端本地原子分配**：发送端对"目标专家"计数器 `atomicAdd`，得到在该专家、该源 rank 分区里的槽位号 | 发送端 | DeepEP LL：`atomicAdd(atomic_counter_per_expert + dst_expert_idx, 1)`（`hybrid-ep@10d4dd73/csrc/kernels/internode_ll.cu` dispatch 发送段） | 每个 (专家, 源 rank) 都要预留最大容量；接收端拿到的是"分区 + 计数"，要再整理 |
 | **先交换计数再分配**：先跑一个 notify/layout 阶段交换每对 rank 的数量，接收端算前缀和后分配 | 双方协商 | DeepEP V1 normal（`get_dispatch_layout` + notify） | 多一轮通信；要把计数同步给 CPU 才能分配输出张量，和 CUDA Graph 冲突 |
-| **全局路由先 AllGather，各自算出确定下标** | 所有人用同一份全局视图算出同一结果 | Hybrid-EP：`Executor::allgather_routing_map` + `scan` kernel 生成 `sparse_to_dense_map`（`third_party/DeepEP-hybrid-ep/csrc/hybrid_ep/executor/executor.cu`、`backend/hybrid_ep_backend.cuh`） | 多一次 AllGather（路由表很小：token 数 × 专家数个 bool 或 top-k 下标）；换来的是 kernel 里不需要任何排队与原子分配 |
+| **发送端按目标 rank 原子分配 + 并行交换计数** | 发送端 | DeepEP V2.5 direct：`atomicAdd(scaleup_atomic_sender_count + dst_rank, 1)`，写对端 `[源 rank][槽位]`；notify warp 同时交换计数（`third_party/DeepEP/deep_ep/include/deep_ep/impls/ep/dispatch.cuh`） | 和 LL 一样要按最坏情况预留，但按 rank 而不是按专家分区；按专家排布挪到 epilogue |
+| **channel 私有 tail + forwarder 原子分配** | 发送端（跨节点）/ 转发者（节点内） | DeepEP V2.5 hybrid：scale-out warp 在寄存器里维护每个目标节点的 tail；forward warp 对节点内目标 `atomicAdd`（`third_party/DeepEP/deep_ep/include/deep_ep/impls/ep/hybrid_dispatch.cuh`） | 每个 (源节点, channel) 预留该 channel 的最大 token 数；需要记转发元数据供 combine 原路返回 |
+| **全局路由先 AllGather，各自算出确定下标** | 所有人用同一份全局视图算出同一结果 | Hybrid-EP：`Executor::allgather_routing_map` + `scan` kernel 生成 `sparse_to_dense_map`（`hybrid-ep@10d4dd73/csrc/hybrid_ep/executor/executor.cu`、`backend/hybrid_ep_backend.cuh`） | 多一次 AllGather（路由表很小：token 数 × 专家数个 bool 或 top-k 下标）；换来的是 kernel 里不需要任何排队与原子分配 |
 
 下图把三种做法按"数据真正发出之前要经过哪些步骤"排成流水，看清多出来的那一轮在哪里：
 
@@ -50,7 +54,7 @@ C. allgather routing (Hybrid-EP)
 
 ### 决定 2：完成怎么通知（信号）
 
-单边 WRITE 不会在接收端产生 CQE，接收端要靠**轮询内存里的某个标志**判断数据到齐。几种实现都用同一个技巧：**数据和标志走同一个 RC QP，标志排在数据后面**，利用 RC 按序执行，让"标志可见"蕴含"数据可见"。
+单边 WRITE 不会在接收端产生 CQE，接收端要靠**轮询内存里的某个标志**判断数据到齐。V1 LL、Hybrid-EP、NCCL EP LL 都用同一个技巧：**数据和标志走同一个 RC QP，标志排在数据后面**，利用 RC 按序执行，让"标志可见"蕴含"数据可见"。
 
 下图是这个技巧在一条 RC QP 上的样子：左边是发送端按顺序提交的请求，接收端按 PSN 顺序执行，只轮询最后那个标志：
 
@@ -65,16 +69,20 @@ sender GPU (one RC QP)          wire / responder (PSN order)        receiver mem
                                         receiver spins on flag ───────┘
 ```
 
-标志在最后一个 PSN 上，它被执行时前面的 WRITE 已经执行完；如果标志走另一条 QP，两条 QP 之间没有顺序，这个推理就不成立（见下文"性能要点与常见坑"）。乱序放置网卡上的可见性仍是待确认项（见 [README](README.md) 待深入）。
+标志在最后一个 PSN 上，它被执行时前面的 WRITE 已经执行完（V2.5 direct 换了一种做法：先 flush 等本地完成再发信号，数据和信号可以不在同一个 QP，见下表）；如果标志走另一条 QP，两条 QP 之间没有顺序，这个推理就不成立（见下文"性能要点与常见坑"）。乱序放置网卡上的可见性仍是待确认项（见 [README](README.md) 待深入）。
 
 | 实现 | 数据 | 标志 | 粒度 |
 |---|---|---|---|
 | DeepEP LL dispatch | `nvshmemi_ibgda_put_nbi_warp`（RDMA WRITE），QP 号 = 目标本地专家号 | `nvshmemi_ibgda_amo_nonfetch_add` 写 `-(n+1)`，同一 QP 号 | 每 (专家, 源 rank) 一个计数 |
 | DeepEP LL combine | 同上 | 原子加 1 到 `rdma_recv_flag[global_expert]` | 每 (专家, 源 rank) 一个标志 |
 | Hybrid-EP dispatch | `doca_gpu_dev_verbs_wqe_prepare_write` 若干个 | 同一批 WQE 末尾一个 `ATOMIC_FA` 加 1 | 每 (chunk, 源节点) 一个 64 位标志，期望值逐次递增 |
+| DeepEP V2.5 direct | `gin.put` / NVLink TMA 直写，数据分散在多个 QP | 不靠同 QP 顺序：`gpu_barrier` 先 `ncclGin::flush` 全部 QP，再用 QP 0 发 `ncclGin_SignalInc` | 全组一次 |
+| DeepEP V2.5 hybrid 跨节点 | `gin.put<ncclTeamTagRail>`（批量门铃） | 同一 GIN context 上 `red_add_rel` 推进 `(finish, tail)`，每 6 个 token 一次 | 每 (channel, 源节点) 一个 64 位 tail |
 | NCCL EP LL | `ncclGin::put` | `ncclGin_SignalAdd{signalId, numTokensSent + 1}` 随最后一次 put 一起带上 | 每 (专家, 源 rank) 一个 GIN signal |
 
 为什么 LL 写 `-(n+1)` 而不是 `n`：缓冲区在用之前会被清零，0 被用来表示"还没到"；如果某个源 rank 一个 token 都不发，计数也必须是非零才能让接收端停止等待。
+
+V2.5 也用同样的编码（`math::encode_decode_positive`，见 [02](02-deepep-v25-overview.md) 第 7 节），并把"到齐判定"放进高 32 位：每个写方加 `1 << 32`，读方等高位等于写方个数。
 
 Hybrid-EP 用"期望值递增"而不是"用完清零"：每次调用后 `update_expected_value_kernel` 把期望值加一个增量（`hybrid_ep_backend.cuh`），标志永远单调增加，省掉每轮清零和清零后的同步。
 
@@ -82,10 +90,12 @@ Hybrid-EP 用"期望值递增"而不是"用完清零"：每次调用后 `update_
 
 | 实现 | 上界 | 规模（量级） |
 |---|---|---|
-| DeepEP LL | 每 (本地专家, 源 rank) 预留 `num_max_dispatch_tokens_per_rank` 个槽位；发送/接收/信号各两份（奇偶双缓冲） | DeepSeek-V3 量级（hidden 7168、256 专家、每 rank 128 token）约 1.8 GB/rank（按 `csrc/config.hpp` 的 `LowLatencyLayout` 公式算出，见 [02](02-deepep-low-latency.md)） |
-| Hybrid-EP | 假设所有 token 都路由到同一个 rank：`max_tokens_per_rank × ranks_per_node × num_nodes` 行 | 文档给出 EP64、4096 token/rank、BF16 时约 4 GB/rank（`third_party/DeepEP-hybrid-ep/docs/Hybrid-EP_Implementation.md` §4.2） |
+| DeepEP LL | 每 (本地专家, 源 rank) 预留 `num_max_dispatch_tokens_per_rank` 个槽位；发送/接收/信号各两份（奇偶双缓冲） | DeepSeek-V3 量级（hidden 7168、256 专家、每 rank 128 token）约 1.8 GB/rank（按 `hybrid-ep@10d4dd73/csrc/config.hpp` 的 `LowLatencyLayout` 公式算出） |
+| DeepEP V2.5 direct | dispatch 接收 `[R][M]`，combine 接收 `[min(R,k)][M]`，两者共用一块、取大者 | 比 LL 少一个"本地专家数"倍；公式见 `third_party/DeepEP/csrc/buffers/ep.hpp` 的 `get_dispatch_buffer_size` / `get_combine_buffer_size` |
+| DeepEP V2.5 hybrid | scale-up `[U][S×M]` + scale-out 接收 `[S][M+1280]` + 发送 `[1][M]` | 同上 |
+| Hybrid-EP | 假设所有 token 都路由到同一个 rank：`max_tokens_per_rank × ranks_per_node × num_nodes` 行 | 文档给出 EP64、4096 token/rank、BF16 时约 4 GB/rank（`hybrid-ep@10d4dd73/docs/Hybrid-EP_Implementation.md` §4.2） |
 
-两者都选择**最坏情况预分配**。DeepEP 的 README 也建议"自己实现时考虑按最大容量分配固定缓冲，比队列更简单、更快"（`third_party/DeepEP-hybrid-ep/README.md` Notices 一节）。代价是显存，好处是没有队列管理、没有死锁、形状固定可被 CUDA Graph 捕获。
+两者都选择**最坏情况预分配**。DeepEP 的 README 也建议"自己实现时考虑按最大容量分配固定缓冲，比队列更简单、更快"（`hybrid-ep@10d4dd73/README.md` Notices 一节）。代价是显存，好处是没有队列管理、没有死锁、形状固定可被 CUDA Graph 捕获。
 
 ### 决定 4：直连还是分层
 
@@ -98,6 +108,7 @@ Hybrid-EP 用"期望值递增"而不是"用完清零"：每次调用后 `update_
 ```
 
 - decode 的 token 少（每 rank 几十到一百多），总字节不大，**跳数**决定延迟，所以选直连。
+- DeepEP V2.5 不再按工况选，而是按拓扑：单节点或 `allow_hybrid_mode=False` 走直连（direct），多节点默认走分层（hybrid），decode 和 prefill 都用同一种；直连时同一 rank 的多个专家也只发一份。
 - prefill/训练的 token 多（每 rank 数千），网卡带宽是瓶颈，**跨网字节**决定时间，所以选分层：同一个 token 去往同一节点的多个 GPU 时只过一次网卡；而且只发给同号 GPU，流量天然落在同一个 rail 上（rail-optimized 组网友好）。
 
 ### 决定 5：用多少 SM、怎么用
@@ -106,7 +117,8 @@ Hybrid-EP 用"期望值递增"而不是"用完清零"：每次调用后 `update_
 |---|---|---|
 | DeepEP LL | RDMA 部分由网卡搬；SM 只负责 FP8 量化、写 WQE、敲门铃；接收阶段由 SM 拷贝整理 | launch 时 `num_sms = ceil(num_experts / num_warp_groups)`，几乎占满整卡，但只占很短时间；有 recv hook 时发送和接收之间不占 SM |
 | V1 normal | SM 上的 warp 用 LD/ST 搬 NVLink 数据 | 典型 20~24 个 SM（`Buffer.set_num_sms(24)`，vLLM 中 `num_sms = 20`） |
-| Hybrid-EP | TMA（`cp.async.bulk`）搬 SMEM↔GMEM，warp 只发指令 | 4~16 个 SM 即可接近跑满网卡（`third_party/DeepEP-hybrid-ep/docs/README_Hybrid-EP.md` 性能表） |
+| DeepEP V2.5 | TMA 搬 SMEM↔GMEM；网卡由 NCCL GIN（GDAKI）驱动 | `get_theoretical_num_sms` 按带宽模型解析估算（≥4、按 4 对齐），可逐次覆盖；不支持零 SM 的 RDMA 路径 |
+| Hybrid-EP | TMA（`cp.async.bulk`）搬 SMEM↔GMEM，warp 只发指令 | 4~16 个 SM 即可接近跑满网卡（`hybrid-ep@10d4dd73/docs/README_Hybrid-EP.md` 性能表） |
 
 SM 占用决定了通信能不能和计算重叠：通信 kernel 占的 SM 越少，同时运行的 GEMM 能用的就越多。
 
@@ -114,11 +126,13 @@ SM 占用决定了通信能不能和计算重叠：通信 kernel 占的 SM 越�
 
 | 决定 | 看哪里 |
 |---|---|
-| 槽位（发送端原子分配） | `third_party/DeepEP-hybrid-ep/csrc/kernels/internode_ll.cu`：`dispatch` kernel 的 "Issue IBGDA sends" 段 |
-| 槽位（全局确定下标） | `third_party/DeepEP-hybrid-ep/csrc/hybrid_ep/backend/hybrid_ep_backend.cuh`：`scan` kernel；`executor/executor.cu`：`allgather_routing_map` |
-| 信号（同 QP 按序） | `third_party/DeepEP-hybrid-ep/csrc/kernels/ibgda_device.cuh`：`nvshmemi_ibgda_put_nbi_warp`、`nvshmemi_ibgda_amo_nonfetch_add`（都按 `qp_id` 取 `ibgda_get_rc`） |
-| 缓冲区布局 | `third_party/DeepEP-hybrid-ep/csrc/config.hpp`：`struct LowLatencyLayout`；Hybrid-EP 见 `docs/Hybrid-EP_Implementation.md` §4 |
+| 槽位（发送端原子分配） | `hybrid-ep@10d4dd73/csrc/kernels/internode_ll.cu`：`dispatch` kernel 的 "Issue IBGDA sends" 段 |
+| 槽位（全局确定下标） | `hybrid-ep@10d4dd73/csrc/hybrid_ep/backend/hybrid_ep_backend.cuh`：`scan` kernel；`executor/executor.cu`：`allgather_routing_map` |
+| 信号（同 QP 按序） | `hybrid-ep@10d4dd73/csrc/kernels/ibgda_device.cuh`：`nvshmemi_ibgda_put_nbi_warp`、`nvshmemi_ibgda_amo_nonfetch_add`（都按 `qp_id` 取 `ibgda_get_rc`） |
+| 缓冲区布局 | `hybrid-ep@10d4dd73/csrc/config.hpp`：`struct LowLatencyLayout`；Hybrid-EP 见 `docs/Hybrid-EP_Implementation.md` §4 |
 | SM/warp 布局 | `hybrid_ep_backend.cuh` 中 `dispatch_kernel`、`combine_kernel` 前的注释 |
+| V2.5 槽位、计数、完成 | `third_party/DeepEP/deep_ep/include/deep_ep/impls/ep/dispatch.cuh`、`hybrid_dispatch.cuh`；`third_party/DeepEP/deep_ep/include/deep_ep/comm/barrier.cuh` 的 `gpu_barrier` |
+| V2.5 缓冲与 SM 估算 | `third_party/DeepEP/csrc/buffers/ep.hpp`；`third_party/DeepEP/deep_ep/buffers/ep.py` 的 `get_theoretical_num_sms` |
 
 ## 性能要点与常见坑
 
@@ -137,8 +151,8 @@ SM 占用决定了通信能不能和计算重叠：通信 kernel 占的 SM 越�
 
 ## 补充：V1 normal 怎样把计数交给 CPU
 
-`third_party/DeepEP-hybrid-ep/csrc/deep_ep.cpp` 在构造 Buffer 时用 `cudaMallocHost(..., cudaHostAllocMapped)` 分配 `moe_recv_counter`，并取得它的设备指针 `moe_recv_counter_mapped`。dispatch 前 host 把它置为 -1，`notify_dispatch` kernel（`csrc/kernels/intranode.cu` / `internode.cu`）交换完计数后直接把总数写进这块零拷贝内存，host 在 `while (true)` 里轮询它变成非负值，然后才分配 `recv_x`。这就是"normal 模式阻塞 CPU、不兼容 CUDA Graph"的具体来源。
+`hybrid-ep@10d4dd73/csrc/deep_ep.cpp` 在构造 Buffer 时用 `cudaMallocHost(..., cudaHostAllocMapped)` 分配 `moe_recv_counter`，并取得它的设备指针 `moe_recv_counter_mapped`。dispatch 前 host 把它置为 -1，`notify_dispatch` kernel（`csrc/kernels/intranode.cu` / `internode.cu`）交换完计数后直接把总数写进这块零拷贝内存，host 在 `while (true)` 里轮询它变成非负值，然后才分配 `recv_x`。这就是"normal 模式阻塞 CPU、不兼容 CUDA Graph"的具体来源。
 
 ## 待深入
 
-- 待确认：V1 normal 跨节点 kernel 里 `kRDMASender`、`kRDMAAndNVLForwarder`、`kNVLReceivers` 等 warp 角色之间的队列协议（head/tail 指针）；确认方式：读 `third_party/DeepEP-hybrid-ep/csrc/kernels/internode.cu` 中 `enum class WarpRole` 之后的 dispatch 主体。
+- 待确认：V1 normal 跨节点 kernel 里 `kRDMASender`、`kRDMAAndNVLForwarder`、`kNVLReceivers` 等 warp 角色之间的队列协议（head/tail 指针）；确认方式：读 `hybrid-ep@10d4dd73/csrc/kernels/internode.cu` 中 `enum class WarpRole` 之后的 dispatch 主体。
